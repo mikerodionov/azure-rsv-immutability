@@ -1,19 +1,21 @@
 #!/bin/bash
 # ===================================================================================================
 # RSV Immutability Readiness Check
-# Produces 3 CSVs + summary table to assess readiness for vault locking.
+# Produces 4 CSVs + summary table to assess readiness for vault locking.
 #
-# Output files (timestamped):
-#   1) no-expiry-rps-YYYYMMDD-HHMMSS.csv       — Recovery points with no expiry
-#   2) no-policy-items-YYYYMMDD-HHMMSS.csv     — Backup items with no policy
-#   3) no-expiry-no-policy-YYYYMMDD-HHMMSS.csv — Items in BOTH (the real risk)
+# Output files (in reports/ directory, timestamped):
+#   1) reports/no-expiry-rps-YYYYMMDD-HHMMSS.csv       — Recovery points with no expiry
+#   2) reports/no-policy-items-YYYYMMDD-HHMMSS.csv     — Backup items with no policy
+#   3) reports/no-expiry-no-policy-YYYYMMDD-HHMMSS.csv — Items in BOTH (the real risk)
+#   4) reports/old-no-expiry-rps-YYYYMMDD-HHMMSS.csv   — No-expiry RPs older than RP_AGE_MONTHS
 #
 # Usage:
-#   ./rsv-immutability-readiness-check.sh                     # default (10 parallel, skip last 48h)
-#   SKIP_RECENT_HOURS=0 ./rsv-immutability-readiness-check.sh # include all RPs
-#   PARALLEL=5 ./rsv-immutability-readiness-check.sh          # 5 parallel vaults
-#   DEBUG=1 ./rsv-immutability-readiness-check.sh             # debug (3 vaults, verbose)
-#   DEBUG=1 DEBUG_MAX=1 ./rsv-immutability-readiness-check.sh # debug 1 vault
+#   ./scripts/rsv-immutability-readiness-check.sh                     # default (10 parallel, skip last 48h)
+#   SKIP_RECENT_HOURS=0 ./scripts/rsv-immutability-readiness-check.sh # include all RPs
+#   PARALLEL=5 ./scripts/rsv-immutability-readiness-check.sh          # 5 parallel vaults
+#   DEBUG=1 ./scripts/rsv-immutability-readiness-check.sh             # debug (3 vaults, verbose)
+#   DEBUG=1 DEBUG_MAX=1 ./scripts/rsv-immutability-readiness-check.sh # debug 1 vault
+#   RP_AGE_MONTHS=6 ./scripts/rsv-immutability-readiness-check.sh     # old RPs threshold: 6 months
 # ===================================================================================================
 set -e
 
@@ -22,11 +24,27 @@ DEBUG="${DEBUG:-0}"
 DEBUG_MAX="${DEBUG_MAX:-3}"
 PARALLEL="${PARALLEL:-10}"
 SKIP_RECENT_HOURS="${SKIP_RECENT_HOURS:-48}"
+RP_AGE_MONTHS="${RP_AGE_MONTHS:-13}"
+
+# ---- Helper: human-readable elapsed time ----
+format_time() {
+  local SECS=$1
+  if [[ $SECS -lt 60 ]]; then
+    echo "${SECS}s"
+  else
+    echo "$((SECS / 60))m $((SECS % 60))s"
+  fi
+}
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPORT_DIR="${REPO_ROOT}/reports"
+mkdir -p "$REPORT_DIR"
 
 TS=$(date +%Y%m%d-%H%M%S)
-CSV_NO_EXPIRY="no-expiry-rps-${TS}.csv"
-CSV_NO_POLICY="no-policy-items-${TS}.csv"
-CSV_OVERLAP="no-expiry-no-policy-${TS}.csv"
+CSV_NO_EXPIRY="${REPORT_DIR}/no-expiry-rps-${TS}.csv"
+CSV_NO_POLICY="${REPORT_DIR}/no-policy-items-${TS}.csv"
+CSV_OVERLAP="${REPORT_DIR}/no-expiry-no-policy-${TS}.csv"
+CSV_OLD_RPS="${REPORT_DIR}/old-no-expiry-rps-${TS}.csv"
 
 TMPDIR_WORK=$(mktemp -d)
 
@@ -54,6 +72,11 @@ else
   CUTOFF_TS=""
   echo "[*] No age filter — reporting all no-expiry RPs"
 fi
+
+# ---- Cutoff for old RPs report ----
+RP_AGE_CUTOFF=$(date -u -d "${RP_AGE_MONTHS} months ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+  || date -u -v-${RP_AGE_MONTHS}m +%Y-%m-%dT%H:%M:%S)
+echo "[*] Old RP threshold: ${RP_AGE_MONTHS} months (before $RP_AGE_CUTOFF)"
 
 if [[ "$DEBUG" == "1" ]]; then
   echo "[*] DEBUG MODE — max $DEBUG_MAX vaults, verbose"
@@ -98,7 +121,7 @@ if [[ -z "$ALL_VAULTS" ]]; then
 fi
 
 VAULT_COUNT=$(echo "$ALL_VAULTS" | wc -l | tr -d ' ')
-echo "[*] Found $VAULT_COUNT vaults ($((SECONDS - T1))s)"
+echo "[*] Found $VAULT_COUNT vaults ($(format_time $((SECONDS - T1))))"
 echo "[*] Scanning recovery points ($PARALLEL parallel workers)..."
 
 # ---- Worker function ----
@@ -245,7 +268,25 @@ echo ""
 
 PHASE1_COUNT=$(tail -n +2 "$CSV_NO_EXPIRY" | wc -l | tr -d ' ')
 PHASE1_TIME=$((SECONDS - T1))
-echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs found (${PHASE1_TIME}s)"
+echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs found ($(format_time $PHASE1_TIME))"
+echo ""
+
+# =============================================================================
+# PHASE 1.5: No-expiry RPs older than RP_AGE_MONTHS
+# =============================================================================
+echo "[*] Filtering no-expiry RPs older than ${RP_AGE_MONTHS} months..."
+
+echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType" > "$CSV_OLD_RPS"
+
+while IFS=',' read -r SUB RG VAULT ITEM RP_TIME RP_TYPE; do
+  RP_TIME_CLEAN=$(echo "$RP_TIME" | sed 's/"//g')
+  if [[ "$RP_TIME_CLEAN" < "$RP_AGE_CUTOFF" ]]; then
+    echo "$SUB,$RG,$VAULT,$ITEM,$RP_TIME,$RP_TYPE" >> "$CSV_OLD_RPS"
+  fi
+done < <(tail -n +2 "$CSV_NO_EXPIRY")
+
+OLD_RP_COUNT=$(tail -n +2 "$CSV_OLD_RPS" | wc -l | tr -d ' ')
+echo "[*] Found $OLD_RP_COUNT no-expiry RPs older than ${RP_AGE_MONTHS} months"
 echo ""
 
 # =============================================================================
@@ -282,21 +323,25 @@ while true; do
 done
 
 PHASE2_COUNT=$(tail -n +2 "$CSV_NO_POLICY" | wc -l | tr -d ' ')
-echo "[*] Phase 2 done: $PHASE2_COUNT items with no policy ($((SECONDS - T2))s)"
+echo "[*] Phase 2 done: $PHASE2_COUNT items with no policy ($(format_time $((SECONDS - T2))))"
 echo ""
 
 # =============================================================================
 # PHASE 3: Cross-reference — items in BOTH lists (the real risk)
 # =============================================================================
 echo "[Phase 3/3] Cross-referencing no-expiry RPs with no-policy items..."
+T3=$SECONDS
 
 echo "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp" > "$CSV_OVERLAP"
 
 # Build lookup: lowercase VM name → no-expiry RP count + oldest date
 declare -A RP_COUNTS
 declare -A RP_OLDEST
+RP_IDX=0
 while IFS=',' read -r SUB RG VAULT ITEM RP_TIME RP_TYPE; do
-  # Extract VM name (last segment of itemName after last semicolon)
+  RP_IDX=$((RP_IDX + 1))
+  [[ $((RP_IDX % 500)) -eq 0 ]] && printf "\r  [%d/%d RPs indexed]" "$RP_IDX" "$PHASE1_COUNT"
+
   VM_KEY=$(echo "$ITEM" | sed 's/"//g' | awk -F';' '{print tolower($NF)}')
   VAULT_CLEAN=$(echo "$VAULT" | sed 's/"//g')
   LOOKUP="${VAULT_CLEAN}|${VM_KEY}"
@@ -308,10 +353,15 @@ while IFS=',' read -r SUB RG VAULT ITEM RP_TIME RP_TYPE; do
     RP_OLDEST[$LOOKUP]="$RP_TIME_CLEAN"
   fi
 done < <(tail -n +2 "$CSV_NO_EXPIRY")
+[[ $PHASE1_COUNT -gt 0 ]] && printf "\r  [%d/%d RPs indexed]          \n" "$PHASE1_COUNT" "$PHASE1_COUNT"
 
 # Match against no-policy items
 OVERLAP_COUNT=0
+NP_IDX=0
 while IFS=',' read -r SUB RG VAULT FNAME ITYPE PSTATE LBT; do
+  NP_IDX=$((NP_IDX + 1))
+  [[ $((NP_IDX % 200)) -eq 0 ]] && printf "\r  [%d/%d items checked, %d overlaps]" "$NP_IDX" "$PHASE2_COUNT" "$OVERLAP_COUNT"
+
   VAULT_CLEAN=$(echo "$VAULT" | sed 's/"//g')
   FNAME_CLEAN=$(echo "$FNAME" | sed 's/"//g' | tr '[:upper:]' '[:lower:]')
   LOOKUP="${VAULT_CLEAN}|${FNAME_CLEAN}"
@@ -321,8 +371,10 @@ while IFS=',' read -r SUB RG VAULT FNAME ITYPE PSTATE LBT; do
     echo "$SUB,$RG,$VAULT,$FNAME,$ITYPE,$PSTATE,$LBT,\"${RP_COUNTS[$LOOKUP]}\",\"${RP_OLDEST[$LOOKUP]}\"" >> "$CSV_OVERLAP"
   fi
 done < <(tail -n +2 "$CSV_NO_POLICY")
+[[ $PHASE2_COUNT -gt 0 ]] && printf "\r  [%d/%d items checked, %d overlaps]          \n" "$PHASE2_COUNT" "$PHASE2_COUNT" "$OVERLAP_COUNT"
 
-echo "[*] Phase 3 done: $OVERLAP_COUNT items with no policy AND no-expiry RPs"
+PHASE3_TIME=$((SECONDS - T3))
+echo "[*] Phase 3 done: $OVERLAP_COUNT items with no policy AND no-expiry RPs ($(format_time $PHASE3_TIME))"
 echo ""
 
 # =============================================================================
@@ -364,6 +416,9 @@ echo "  ── Phase 3: RISK — No Policy + No Expiry ────"
 printf "  %-45s %s\n" "Items with no policy AND no-expiry RPs:" "$OVERLAP_COUNT"
 printf "  %-45s %s\n" "Total no-expiry RPs for those items:" "$OVERLAP_RP_SUM"
 echo ""
+echo "  ── Old No-Expiry RPs (>${RP_AGE_MONTHS} months) ──────"
+printf "  %-45s %s\n" "No-expiry RPs older than ${RP_AGE_MONTHS} months:" "$OLD_RP_COUNT"
+echo ""
 if [[ "$OVERLAP_COUNT" -gt 0 ]]; then
   echo "  ⚠  ACTION REQUIRED before locking immutability!"
   echo "     These items have stopped protection, no policy,"
@@ -378,6 +433,7 @@ echo "  ── Output Files ─────────────────�
 echo "  1) $CSV_NO_EXPIRY"
 echo "  2) $CSV_NO_POLICY"
 echo "  3) $CSV_OVERLAP"
+echo "  4) $CSV_OLD_RPS"
 echo ""
-echo "  Total execution time: ${SECONDS}s"
+echo "  Total execution time: $(format_time $SECONDS)"
 echo "============================================="
