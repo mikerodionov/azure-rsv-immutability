@@ -1,13 +1,16 @@
 #!/bin/bash
 # ===================================================================================================
 # RSV Immutability Readiness Check
-# Produces 4 CSVs + summary table to assess readiness for vault locking.
+# Produces up to 6 CSVs + summary table to assess readiness for vault locking.
+# All CSVs are written on-the-fly so partial data survives crashes.
 #
-# Output files (in reports/ directory, timestamped):
-#   1) reports/no-expiry-rps-YYYYMMDD-HHMMSS.csv       — Recovery points with no expiry
-#   2) reports/no-policy-items-YYYYMMDD-HHMMSS.csv     — Backup items with no policy
-#   3) reports/no-expiry-no-policy-YYYYMMDD-HHMMSS.csv — Items in BOTH (the real risk)
-#   4) reports/old-no-expiry-rps-YYYYMMDD-HHMMSS.csv   — No-expiry RPs older than RP_AGE_MONTHS
+# Output files (in ../rsv-reports/ one level above repo, timestamped):
+#   1) no-expiry-rps-YYYYMMDD-HHMMSS.csv        — All recovery points with no expiry date
+#   2) no-policy-items-YYYYMMDD-HHMMSS.csv      — Backup items with no policy assigned
+#   3) no-expiry-no-policy-YYYYMMDD-HHMMSS.csv  — Items in BOTH (the real risk)
+#   4) old-no-expiry-rps-YYYYMMDD-HHMMSS.csv    — No-expiry RPs older than RP_AGE_MONTHS
+#   5) clean-vaults-YYYYMMDD-HHMMSS.csv         — Vaults not appearing in reports 3 or 4
+#   6) dirty-vaults-YYYYMMDD-HHMMSS.csv         — Vaults appearing in report 3 or 4
 #
 # Usage:
 #   ./scripts/rsv-immutability-readiness-check.sh                     # default (10 parallel, skip last 48h)
@@ -16,6 +19,8 @@
 #   DEBUG=1 ./scripts/rsv-immutability-readiness-check.sh             # debug (3 vaults, verbose)
 #   DEBUG=1 DEBUG_MAX=1 ./scripts/rsv-immutability-readiness-check.sh # debug 1 vault
 #   RP_AGE_MONTHS=6 ./scripts/rsv-immutability-readiness-check.sh     # old RPs threshold: 6 months
+#   CSV_OUTPUT=0 ./scripts/rsv-immutability-readiness-check.sh        # summary only, no CSV files
+#   VAULT_TIMEOUT=600 ./scripts/rsv-immutability-readiness-check.sh   # 10min timeout per vault
 # ===================================================================================================
 set -e
 
@@ -25,6 +30,8 @@ DEBUG_MAX="${DEBUG_MAX:-3}"
 PARALLEL="${PARALLEL:-10}"
 SKIP_RECENT_HOURS="${SKIP_RECENT_HOURS:-48}"
 RP_AGE_MONTHS="${RP_AGE_MONTHS:-13}"
+CSV_OUTPUT="${CSV_OUTPUT:-1}"
+VAULT_TIMEOUT="${VAULT_TIMEOUT:-600}"
 
 # ---- Helper: human-readable elapsed time ----
 format_time() {
@@ -37,14 +44,8 @@ format_time() {
 }
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REPORT_DIR="${REPO_ROOT}/reports"
+REPORT_DIR="$(cd "$REPO_ROOT/.." && pwd)/rsv-reports"
 mkdir -p "$REPORT_DIR"
-
-TS=$(date +%Y%m%d-%H%M%S)
-CSV_NO_EXPIRY="${REPORT_DIR}/no-expiry-rps-${TS}.csv"
-CSV_NO_POLICY="${REPORT_DIR}/no-policy-items-${TS}.csv"
-CSV_OVERLAP="${REPORT_DIR}/no-expiry-no-policy-${TS}.csv"
-CSV_OLD_RPS="${REPORT_DIR}/old-no-expiry-rps-${TS}.csv"
 
 TMPDIR_WORK=$(mktemp -d)
 
@@ -57,6 +58,26 @@ cleanup() {
   rm -rf "$TMPDIR_WORK"
 }
 trap cleanup EXIT
+
+TS=$(date +%Y%m%d-%H%M%S)
+
+# All CSVs go to report dir when enabled (crash-safe, on-the-fly writes survive)
+# When disabled, everything goes to temp (discarded on exit)
+if [[ "$CSV_OUTPUT" == "1" ]]; then
+  CSV_NO_EXPIRY="${REPORT_DIR}/no-expiry-rps-${TS}.csv"
+  CSV_NO_POLICY="${REPORT_DIR}/no-policy-items-${TS}.csv"
+  CSV_OVERLAP="${REPORT_DIR}/no-expiry-no-policy-${TS}.csv"
+  CSV_OLD_RPS="${REPORT_DIR}/old-no-expiry-rps-${TS}.csv"
+  CSV_CLEAN="${REPORT_DIR}/clean-vaults-${TS}.csv"
+  CSV_DIRTY="${REPORT_DIR}/dirty-vaults-${TS}.csv"
+else
+  CSV_NO_EXPIRY="${TMPDIR_WORK}/no-expiry-rps.csv"
+  CSV_NO_POLICY="${TMPDIR_WORK}/no-policy-items.csv"
+  CSV_OVERLAP="${TMPDIR_WORK}/no-expiry-no-policy.csv"
+  CSV_OLD_RPS="${TMPDIR_WORK}/old-no-expiry-rps.csv"
+  CSV_CLEAN="${TMPDIR_WORK}/clean-vaults.csv"
+  CSV_DIRTY="${TMPDIR_WORK}/dirty-vaults.csv"
+fi
 
 echo "============================================="
 echo " RSV Immutability Readiness Check"
@@ -77,6 +98,7 @@ fi
 RP_AGE_CUTOFF=$(date -u -d "${RP_AGE_MONTHS} months ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null \
   || date -u -v-${RP_AGE_MONTHS}m +%Y-%m-%dT%H:%M:%S)
 echo "[*] Old RP threshold: ${RP_AGE_MONTHS} months (before $RP_AGE_CUTOFF)"
+echo "[*] Per-vault timeout: ${VAULT_TIMEOUT}s"
 
 if [[ "$DEBUG" == "1" ]]; then
   echo "[*] DEBUG MODE — max $DEBUG_MAX vaults, verbose"
@@ -88,7 +110,7 @@ echo ""
 # =============================================================================
 echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType" > "$CSV_NO_EXPIRY"
 
-echo "[Phase 1/3] Fetching all RSV vaults via Azure Resource Graph..."
+echo "[Phase 1/4] Fetching all RSV vaults via Azure Resource Graph..."
 T1=$SECONDS
 
 ALL_VAULTS=""
@@ -219,15 +241,30 @@ export TMPDIR_WORK CUTOFF_TS CSV_NO_EXPIRY
 
 VAULT_NUM=0
 ACTIVE_PIDS=()
-COMPLETED=0
+declare -A PID_START_TIMES
+declare -A PID_VAULT_NAMES
 
 print_progress() {
-  # Count completed workers (PIDs that are no longer running)
-  local DONE=0
-  for F in "$TMPDIR_WORK"/vault-*.log; do
-    [[ -f "$F" ]] && DONE=$((DONE + 1))
+  local ACTIVE=0
+  for PID in "${ACTIVE_PIDS[@]}"; do
+    kill -0 "$PID" 2>/dev/null && ACTIVE=$((ACTIVE + 1))
   done
-  printf "\r  [%d/%d vaults processed, %d active workers]" "$DONE" "$VAULT_COUNT" "${#ACTIVE_PIDS[@]}"
+  local DONE=$((VAULT_NUM - ACTIVE))
+  printf "\r  [%d/%d vaults completed, %d active workers]" "$DONE" "$VAULT_COUNT" "$ACTIVE"
+}
+
+kill_stale_workers() {
+  local NOW=$SECONDS
+  for PID in "${ACTIVE_PIDS[@]}"; do
+    if kill -0 "$PID" 2>/dev/null; then
+      local ELAPSED=$((NOW - ${PID_START_TIMES[$PID]:-$NOW}))
+      if [[ $ELAPSED -ge $VAULT_TIMEOUT ]]; then
+        echo "[!] TIMEOUT: ${PID_VAULT_NAMES[$PID]} after ${ELAPSED}s (PID $PID)" >> "$TMPDIR_WORK/timeouts.log"
+        kill -9 "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || true
+      fi
+    fi
+  done
 }
 
 while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
@@ -235,9 +272,14 @@ while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
   [[ "$DEBUG" == "1" && $VAULT_NUM -gt $DEBUG_MAX ]] && break
 
   process_vault "$VAULT_NUM" "$VAULT_COUNT" "$SUB_ID" "$RG" "$VAULT_NAME" "$DEBUG" &
-  ACTIVE_PIDS+=($!)
+  WORKER_PID=$!
+  ACTIVE_PIDS+=($WORKER_PID)
+  PID_START_TIMES[$WORKER_PID]=$SECONDS
+  PID_VAULT_NAMES[$WORKER_PID]="$VAULT_NAME"
+  disown "$WORKER_PID" 2>/dev/null
 
   while [[ ${#ACTIVE_PIDS[@]} -ge $PARALLEL ]]; do
+    kill_stale_workers
     NEW_PIDS=()
     for PID in "${ACTIVE_PIDS[@]}"; do
       if kill -0 "$PID" 2>/dev/null; then
@@ -253,18 +295,28 @@ while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
 
 done <<< "$ALL_VAULTS"
 
-echo "[*] Waiting for workers to finish..."
+# Wait for remaining workers to finish
 while true; do
+  kill_stale_workers
   STILL_RUNNING=0
   for PID in "${ACTIVE_PIDS[@]}"; do
     kill -0 "$PID" 2>/dev/null && STILL_RUNNING=$((STILL_RUNNING + 1))
   done
   [[ $STILL_RUNNING -eq 0 ]] && break
-  print_progress
+  local_done=$((VAULT_NUM - STILL_RUNNING))
+  printf "\r  [%d/%d vaults completed, %d active workers]" "$local_done" "$VAULT_COUNT" "$STILL_RUNNING"
   sleep 2
 done
-wait
-echo ""
+wait 2>/dev/null
+printf "\r  [%d/%d vaults completed, 0 active workers]          \n" "$VAULT_COUNT" "$VAULT_COUNT"
+
+# Report timeouts
+if [[ -f "$TMPDIR_WORK/timeouts.log" ]]; then
+  TIMEOUT_COUNT=$(grep -c '.' "$TMPDIR_WORK/timeouts.log" 2>/dev/null || echo 0)
+  echo "[!] $TIMEOUT_COUNT vault(s) timed out after ${VAULT_TIMEOUT}s:"
+  cat "$TMPDIR_WORK/timeouts.log"
+  echo ""
+fi
 
 PHASE1_COUNT=$(tail -n +2 "$CSV_NO_EXPIRY" | wc -l | tr -d ' ')
 PHASE1_TIME=$((SECONDS - T1))
@@ -292,7 +344,7 @@ echo ""
 # =============================================================================
 # PHASE 2: Backup items with no policy (via ARG query)
 # =============================================================================
-echo "[Phase 2/3] Querying backup items with no policy via ARG..."
+echo "[Phase 2/4] Querying backup items with no policy via ARG..."
 T2=$SECONDS
 
 echo "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime" > "$CSV_NO_POLICY"
@@ -329,7 +381,7 @@ echo ""
 # =============================================================================
 # PHASE 3: Cross-reference — items in BOTH lists (the real risk)
 # =============================================================================
-echo "[Phase 3/3] Cross-referencing no-expiry RPs with no-policy items..."
+echo "[Phase 3/4] Cross-referencing no-expiry RPs with no-policy items..."
 T3=$SECONDS
 
 echo "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp" > "$CSV_OVERLAP"
@@ -378,6 +430,58 @@ echo "[*] Phase 3 done: $OVERLAP_COUNT items with no policy AND no-expiry RPs ($
 echo ""
 
 # =============================================================================
+# PHASE 4: Clean and Dirty vault classification
+# =============================================================================
+echo "[Phase 4/4] Classifying clean and dirty vaults..."
+T4=$SECONDS
+
+echo "subscription,resourceGroup,vaultName,reason" > "$CSV_DIRTY"
+echo "subscription,resourceGroup,vaultName" > "$CSV_CLEAN"
+
+# Build dirty vault set from reports 3 and 4
+declare -A DIRTY_HAS_OVERLAP
+declare -A DIRTY_HAS_OLD_RPS
+
+# From report 3 (no-policy + no-expiry overlap)
+while IFS=',' read -r SUB RG VAULT _REST; do
+  KEY="$(echo "$SUB" | sed 's/"//g')|$(echo "$RG" | sed 's/"//g')|$(echo "$VAULT" | sed 's/"//g')"
+  DIRTY_HAS_OVERLAP[$KEY]=1
+done < <(tail -n +2 "$CSV_OVERLAP")
+
+# From report 4 (old no-expiry RPs)
+while IFS=',' read -r SUB RG VAULT _REST; do
+  KEY="$(echo "$SUB" | sed 's/"//g')|$(echo "$RG" | sed 's/"//g')|$(echo "$VAULT" | sed 's/"//g')"
+  DIRTY_HAS_OLD_RPS[$KEY]=1
+done < <(tail -n +2 "$CSV_OLD_RPS")
+
+# Merge dirty keys
+declare -A DIRTY_VAULTS
+for KEY in "${!DIRTY_HAS_OVERLAP[@]}"; do DIRTY_VAULTS[$KEY]=1; done
+for KEY in "${!DIRTY_HAS_OLD_RPS[@]}"; do DIRTY_VAULTS[$KEY]=1; done
+
+# Write dirty vaults with reasons
+for KEY in "${!DIRTY_VAULTS[@]}"; do
+  IFS='|' read -r D_SUB D_RG D_VAULT <<< "$KEY"
+  REASONS=""
+  [[ -n "${DIRTY_HAS_OVERLAP[$KEY]}" ]] && REASONS="no-policy-no-expiry"
+  [[ -n "${DIRTY_HAS_OLD_RPS[$KEY]}" ]] && REASONS="${REASONS:+${REASONS};}old-no-expiry-rps"
+  echo "\"$D_SUB\",\"$D_RG\",\"$D_VAULT\",\"$REASONS\"" >> "$CSV_DIRTY"
+done
+
+# Write clean vaults (all vaults minus dirty)
+while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
+  KEY="${SUB_ID}|${RG}|${VAULT_NAME}"
+  if [[ -z "${DIRTY_VAULTS[$KEY]}" ]]; then
+    echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\"" >> "$CSV_CLEAN"
+  fi
+done <<< "$ALL_VAULTS"
+
+DIRTY_COUNT=$(tail -n +2 "$CSV_DIRTY" | wc -l | tr -d ' ')
+CLEAN_COUNT=$(tail -n +2 "$CSV_CLEAN" | wc -l | tr -d ' ')
+echo "[*] Phase 4 done: $CLEAN_COUNT clean vaults, $DIRTY_COUNT dirty vaults ($(format_time $((SECONDS - T4))))"
+echo ""
+
+# =============================================================================
 # SUMMARY
 # =============================================================================
 # Count breakdowns
@@ -419,6 +523,10 @@ echo ""
 echo "  ── Old No-Expiry RPs (>${RP_AGE_MONTHS} months) ──────"
 printf "  %-45s %s\n" "No-expiry RPs older than ${RP_AGE_MONTHS} months:" "$OLD_RP_COUNT"
 echo ""
+echo "  ── Phase 4: Vault Classification ─────────────"
+printf "  %-45s %s\n" "Clean vaults (not in reports 3 or 4):" "$CLEAN_COUNT"
+printf "  %-45s %s\n" "Dirty vaults (in report 3 or 4):" "$DIRTY_COUNT"
+echo ""
 if [[ "$OVERLAP_COUNT" -gt 0 ]]; then
   echo "  ⚠  ACTION REQUIRED before locking immutability!"
   echo "     These items have stopped protection, no policy,"
@@ -430,10 +538,16 @@ else
 fi
 echo ""
 echo "  ── Output Files ──────────────────────────────"
-echo "  1) $CSV_NO_EXPIRY"
-echo "  2) $CSV_NO_POLICY"
-echo "  3) $CSV_OVERLAP"
-echo "  4) $CSV_OLD_RPS"
+if [[ "$CSV_OUTPUT" == "1" ]]; then
+  echo "  1) $CSV_NO_EXPIRY"
+  echo "  2) $CSV_NO_POLICY"
+  echo "  3) $CSV_OVERLAP"
+  echo "  4) $CSV_OLD_RPS"
+  echo "  5) $CSV_CLEAN"
+  echo "  6) $CSV_DIRTY"
+else
+  echo "  (CSV output disabled — set CSV_OUTPUT=1 to generate files)"
+fi
 echo ""
 echo "  Total execution time: $(format_time $SECONDS)"
 echo "============================================="
