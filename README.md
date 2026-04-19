@@ -60,7 +60,7 @@ VAULT_TIMEOUT=900 ./scripts/rsv-immutability-readiness-check.sh
 
 | Variable            | Default | Description                                                 |
 |---------------------|---------|-------------------------------------------------------------|
-| `PARALLEL`          | `10`    | Number of parallel vault workers                            |
+| `PARALLEL`          | `10`    | Parallel vault workers (raising this often worsens Azure API throttling) |
 | `SKIP_RECENT_HOURS` | `48`    | Skip no-expiry RPs newer than this (set `0` to include all) |
 | `RP_AGE_MONTHS`     | `13`    | Threshold for the "old RPs" report (CSV #4)                 |
 | `CSV_OUTPUT`        | `1`     | Set `0` to disable CSV file generation (summary only)       |
@@ -72,4 +72,5 @@ VAULT_TIMEOUT=900 ./scripts/rsv-immutability-readiness-check.sh
 
 - Azure CLI (`az`) authenticated with access to target subscriptions
 - `jq` for JSON processing
-- Bash 4+ (for associative arrays)
+- Python 3 (`python3`) — CSV filtering, joins, and clean/dirty vault reports (RFC-safe parsing)
+- Bash 4+ (parallel worker bookkeeping uses associative arrays)

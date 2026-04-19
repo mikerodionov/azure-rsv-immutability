@@ -21,6 +21,11 @@
 #   RP_AGE_MONTHS=6 ./scripts/rsv-immutability-readiness-check.sh     # old RPs threshold: 6 months
 #   CSV_OUTPUT=0 ./scripts/rsv-immutability-readiness-check.sh        # summary only, no CSV files
 #   VAULT_TIMEOUT=600 ./scripts/rsv-immutability-readiness-check.sh   # 10min timeout per vault
+#
+# Notes:
+#   - Default PARALLEL=10 balances throughput vs Azure API throttling; raising it often slows runs.
+#   - Phase 1 writes per-worker temp CSVs then merges once (parallel >> to one file can corrupt CSVs).
+#   - Requires python3 for CSV phases (RFC-safe parsing); az, jq, bash 4+ as before.
 # ===================================================================================================
 set -e
 
@@ -41,6 +46,13 @@ format_time() {
   else
     echo "$((SECS / 60))m $((SECS % 60))s"
   fi
+}
+
+require_python3() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "[!] python3 is required for CSV filtering/join steps (RFC-safe parsing)." >&2
+    exit 1
+  }
 }
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -100,6 +112,8 @@ RP_AGE_CUTOFF=$(date -u -d "${RP_AGE_MONTHS} months ago" +%Y-%m-%dT%H:%M:%S 2>/d
 echo "[*] Old RP threshold: ${RP_AGE_MONTHS} months (before $RP_AGE_CUTOFF)"
 echo "[*] Per-vault timeout: ${VAULT_TIMEOUT}s"
 
+require_python3
+
 if [[ "$DEBUG" == "1" ]]; then
   echo "[*] DEBUG MODE — max $DEBUG_MAX vaults, verbose"
 fi
@@ -152,6 +166,8 @@ process_vault() {
   local VAULT_TMPFILE="$TMPDIR_WORK/vault-${VAULT_NUM}.csv"
   local VAULT_LOG="$TMPDIR_WORK/vault-${VAULT_NUM}.log"
   local DEBUG="$6" VAULT_START=$SECONDS
+
+  : > "$VAULT_TMPFILE"
 
   echo "  [$VAULT_NUM/$VAULT_TOTAL] $VAULT_NAME (sub=$SUB_ID)" >> "$VAULT_LOG"
 
@@ -229,15 +245,13 @@ process_vault() {
       fi
       echo "    [!] Found: $FRIENDLY_ITEM / $RP_NAME ($RP_TIME)" >> "$VAULT_LOG"
       echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\",\"$ITEM_NAME\",\"$RP_TIME\",\"$RP_TYPE\"" >> "$VAULT_TMPFILE"
-      # Append to main CSV immediately (single echo is atomic for short lines)
-      echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\",\"$ITEM_NAME\",\"$RP_TIME\",\"$RP_TYPE\"" >> "$CSV_NO_EXPIRY"
     done <<< "$NO_EXPIRY"
 
   done <<< "$ITEM_LINES"
 }
 
 export -f process_vault
-export TMPDIR_WORK CUTOFF_TS CSV_NO_EXPIRY
+export TMPDIR_WORK CUTOFF_TS
 
 VAULT_NUM=0
 ACTIVE_PIDS=()
@@ -310,6 +324,18 @@ done
 wait 2>/dev/null
 printf "\r  [%d/%d vaults completed, 0 active workers]          \n" "$VAULT_COUNT" "$VAULT_COUNT"
 
+# Merge per-vault rows into the main CSV (parallel appends to one file can interleave and break parsing)
+echo "[*] Merging per-vault results into ${CSV_NO_EXPIRY##*/}..."
+T_MERGE=$SECONDS
+shopt -s nullglob
+mapfile -t _VAULT_CSVS < <(printf '%s\n' "$TMPDIR_WORK"/vault-*.csv 2>/dev/null | LC_ALL=C sort -V)
+for _f in "${_VAULT_CSVS[@]}"; do
+  [[ -s "$_f" ]] || continue
+  cat "$_f" >> "$CSV_NO_EXPIRY"
+done
+shopt -u nullglob
+echo "[*] Merge done ($(format_time $((SECONDS - T_MERGE))))"
+
 # Report timeouts
 if [[ -f "$TMPDIR_WORK/timeouts.log" ]]; then
   TIMEOUT_COUNT=$(grep -c '.' "$TMPDIR_WORK/timeouts.log" 2>/dev/null || echo 0)
@@ -327,18 +353,33 @@ echo ""
 # PHASE 1.5: No-expiry RPs older than RP_AGE_MONTHS
 # =============================================================================
 echo "[*] Filtering no-expiry RPs older than ${RP_AGE_MONTHS} months..."
+T15=$SECONDS
 
-echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType" > "$CSV_OLD_RPS"
+python3 - "$RP_AGE_CUTOFF" "$CSV_NO_EXPIRY" "$CSV_OLD_RPS" <<'PY'
+import csv
+import sys
 
-while IFS=',' read -r SUB RG VAULT ITEM RP_TIME RP_TYPE; do
-  RP_TIME_CLEAN=$(echo "$RP_TIME" | sed 's/"//g')
-  if [[ "$RP_TIME_CLEAN" < "$RP_AGE_CUTOFF" ]]; then
-    echo "$SUB,$RG,$VAULT,$ITEM,$RP_TIME,$RP_TYPE" >> "$CSV_OLD_RPS"
-  fi
-done < <(tail -n +2 "$CSV_NO_EXPIRY")
+cutoff, inp_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+written = 0
+with open(inp_path, newline="") as inf, open(out_path, "w", newline="") as outf:
+    reader = csv.reader(inf)
+    writer = csv.writer(outf)
+    header = next(reader)
+    writer.writerow(header)
+    for row in reader:
+        if len(row) < 6:
+            continue
+        rp_time = row[4]
+        # ISO-8601 timestamps sort/compare lexicographically as chronology for normal formats
+        if rp_time < cutoff:
+            writer.writerow(row)
+            written += 1
+            if written % 50000 == 0:
+                print(f"  ... wrote {written} old RP rows", file=sys.stderr)
+PY
 
 OLD_RP_COUNT=$(tail -n +2 "$CSV_OLD_RPS" | wc -l | tr -d ' ')
-echo "[*] Found $OLD_RP_COUNT no-expiry RPs older than ${RP_AGE_MONTHS} months"
+echo "[*] Found $OLD_RP_COUNT no-expiry RPs older than ${RP_AGE_MONTHS} months ($(format_time $((SECONDS - T15))))"
 echo ""
 
 # =============================================================================
@@ -384,46 +425,82 @@ echo ""
 echo "[Phase 3/4] Cross-referencing no-expiry RPs with no-policy items..."
 T3=$SECONDS
 
-echo "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp" > "$CSV_OVERLAP"
+read -r OVERLAP_COUNT OVERLAP_RP_SUM <<< "$(python3 - "$CSV_NO_EXPIRY" "$CSV_NO_POLICY" "$CSV_OVERLAP" <<'PY'
+import csv
+import sys
+from collections import defaultdict
 
-# Build lookup: lowercase VM name → no-expiry RP count + oldest date
-declare -A RP_COUNTS
-declare -A RP_OLDEST
-RP_IDX=0
-while IFS=',' read -r SUB RG VAULT ITEM RP_TIME RP_TYPE; do
-  RP_IDX=$((RP_IDX + 1))
-  [[ $((RP_IDX % 500)) -eq 0 ]] && printf "\r  [%d/%d RPs indexed]" "$RP_IDX" "$PHASE1_COUNT"
+no_expiry_path, no_policy_path, overlap_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
-  VM_KEY=$(echo "$ITEM" | sed 's/"//g' | awk -F';' '{print tolower($NF)}')
-  VAULT_CLEAN=$(echo "$VAULT" | sed 's/"//g')
-  LOOKUP="${VAULT_CLEAN}|${VM_KEY}"
 
-  RP_COUNTS[$LOOKUP]=$(( ${RP_COUNTS[$LOOKUP]:-0} + 1 ))
+def vm_key_from_item(item: str) -> str:
+    parts = item.split(";")
+    return parts[-1].lower() if parts else item.lower()
 
-  RP_TIME_CLEAN=$(echo "$RP_TIME" | sed 's/"//g')
-  if [[ -z "${RP_OLDEST[$LOOKUP]}" || "$RP_TIME_CLEAN" < "${RP_OLDEST[$LOOKUP]}" ]]; then
-    RP_OLDEST[$LOOKUP]="$RP_TIME_CLEAN"
-  fi
-done < <(tail -n +2 "$CSV_NO_EXPIRY")
-[[ $PHASE1_COUNT -gt 0 ]] && printf "\r  [%d/%d RPs indexed]          \n" "$PHASE1_COUNT" "$PHASE1_COUNT"
 
-# Match against no-policy items
-OVERLAP_COUNT=0
-NP_IDX=0
-while IFS=',' read -r SUB RG VAULT FNAME ITYPE PSTATE LBT; do
-  NP_IDX=$((NP_IDX + 1))
-  [[ $((NP_IDX % 200)) -eq 0 ]] && printf "\r  [%d/%d items checked, %d overlaps]" "$NP_IDX" "$PHASE2_COUNT" "$OVERLAP_COUNT"
+rp_counts = defaultdict(int)
+rp_oldest = {}
 
-  VAULT_CLEAN=$(echo "$VAULT" | sed 's/"//g')
-  FNAME_CLEAN=$(echo "$FNAME" | sed 's/"//g' | tr '[:upper:]' '[:lower:]')
-  LOOKUP="${VAULT_CLEAN}|${FNAME_CLEAN}"
+with open(no_expiry_path, newline="") as f:
+    r = csv.reader(f)
+    next(r)
+    idx = 0
+    for row in r:
+        idx += 1
+        if idx % 500 == 0:
+            print(f"\r  [{idx} RPs indexed]", end="", file=sys.stderr)
+        if len(row) < 6:
+            continue
+        _sub, _rg, vault, item, rp_time, _rp_type = row[:6]
+        lk = f"{vault}|{vm_key_from_item(item)}"
+        rp_counts[lk] += 1
+        if lk not in rp_oldest or rp_time < rp_oldest[lk]:
+            rp_oldest[lk] = rp_time
 
-  if [[ -n "${RP_COUNTS[$LOOKUP]}" ]]; then
-    OVERLAP_COUNT=$((OVERLAP_COUNT + 1))
-    echo "$SUB,$RG,$VAULT,$FNAME,$ITYPE,$PSTATE,$LBT,\"${RP_COUNTS[$LOOKUP]}\",\"${RP_OLDEST[$LOOKUP]}\"" >> "$CSV_OVERLAP"
-  fi
-done < <(tail -n +2 "$CSV_NO_POLICY")
-[[ $PHASE2_COUNT -gt 0 ]] && printf "\r  [%d/%d items checked, %d overlaps]          \n" "$PHASE2_COUNT" "$PHASE2_COUNT" "$OVERLAP_COUNT"
+overlap_count = 0
+overlap_rp_sum = 0
+
+with open(no_policy_path, newline="") as inf, open(overlap_path, "w", newline="") as outf:
+    r = csv.reader(inf)
+    w = csv.writer(outf)
+    next(r)  # skip ARG header in file
+    w.writerow(
+        [
+            "subscriptionId",
+            "resourceGroup",
+            "vaultName",
+            "friendlyName",
+            "itemType",
+            "protectionState",
+            "lastBackupTime",
+            "noExpiryRpCount",
+            "oldestNoExpiryRp",
+        ]
+    )
+    ni = 0
+    for row in r:
+        ni += 1
+        if ni % 200 == 0:
+            print(
+                f"\r  [{ni} items checked, {overlap_count} overlaps]",
+                end="",
+                file=sys.stderr,
+            )
+        if len(row) < 7:
+            continue
+        sub, rg, vault, fname, itype, pstate, lbt = row[:7]
+        lk = f"{vault}|{fname.lower()}"
+        if lk not in rp_counts:
+            continue
+        overlap_count += 1
+        cnt = rp_counts[lk]
+        overlap_rp_sum += cnt
+        w.writerow(row + [str(cnt), rp_oldest[lk]])
+
+print("", file=sys.stderr)
+print(f"{overlap_count} {overlap_rp_sum}")
+PY
+)"
 
 PHASE3_TIME=$((SECONDS - T3))
 echo "[*] Phase 3 done: $OVERLAP_COUNT items with no policy AND no-expiry RPs ($(format_time $PHASE3_TIME))"
@@ -435,46 +512,59 @@ echo ""
 echo "[Phase 4/4] Classifying clean and dirty vaults..."
 T4=$SECONDS
 
-echo "subscription,resourceGroup,vaultName,reason" > "$CSV_DIRTY"
-echo "subscription,resourceGroup,vaultName" > "$CSV_CLEAN"
+printf '%s\n' "$ALL_VAULTS" > "$TMPDIR_WORK/all-vaults.tsv"
 
-# Build dirty vault set from reports 3 and 4
-declare -A DIRTY_HAS_OVERLAP
-declare -A DIRTY_HAS_OLD_RPS
+python3 - "$TMPDIR_WORK/all-vaults.tsv" "$CSV_OVERLAP" "$CSV_OLD_RPS" "$CSV_DIRTY" "$CSV_CLEAN" <<'PY'
+import csv
+import sys
 
-# From report 3 (no-policy + no-expiry overlap)
-while IFS=',' read -r SUB RG VAULT _REST; do
-  KEY="$(echo "$SUB" | sed 's/"//g')|$(echo "$RG" | sed 's/"//g')|$(echo "$VAULT" | sed 's/"//g')"
-  DIRTY_HAS_OVERLAP[$KEY]=1
-done < <(tail -n +2 "$CSV_OVERLAP")
+vaults_path, overlap_path, old_path, dirty_path, clean_path = sys.argv[1:6]
 
-# From report 4 (old no-expiry RPs)
-while IFS=',' read -r SUB RG VAULT _REST; do
-  KEY="$(echo "$SUB" | sed 's/"//g')|$(echo "$RG" | sed 's/"//g')|$(echo "$VAULT" | sed 's/"//g')"
-  DIRTY_HAS_OLD_RPS[$KEY]=1
-done < <(tail -n +2 "$CSV_OLD_RPS")
 
-# Merge dirty keys
-declare -A DIRTY_VAULTS
-for KEY in "${!DIRTY_HAS_OVERLAP[@]}"; do DIRTY_VAULTS[$KEY]=1; done
-for KEY in "${!DIRTY_HAS_OLD_RPS[@]}"; do DIRTY_VAULTS[$KEY]=1; done
+def vault_keys(csv_path: str, skip_header: bool = True):
+    with open(csv_path, newline="") as f:
+        r = csv.reader(f)
+        if skip_header:
+            next(r, None)
+        for row in r:
+            if len(row) >= 3:
+                yield row[0], row[1], row[2]
 
-# Write dirty vaults with reasons
-for KEY in "${!DIRTY_VAULTS[@]}"; do
-  IFS='|' read -r D_SUB D_RG D_VAULT <<< "$KEY"
-  REASONS=""
-  [[ -n "${DIRTY_HAS_OVERLAP[$KEY]}" ]] && REASONS="no-policy-no-expiry"
-  [[ -n "${DIRTY_HAS_OLD_RPS[$KEY]}" ]] && REASONS="${REASONS:+${REASONS};}old-no-expiry-rps"
-  echo "\"$D_SUB\",\"$D_RG\",\"$D_VAULT\",\"$REASONS\"" >> "$CSV_DIRTY"
-done
 
-# Write clean vaults (all vaults minus dirty)
-while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
-  KEY="${SUB_ID}|${RG}|${VAULT_NAME}"
-  if [[ -z "${DIRTY_VAULTS[$KEY]}" ]]; then
-    echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\"" >> "$CSV_CLEAN"
-  fi
-done <<< "$ALL_VAULTS"
+dirty_overlap = set()
+for sub, rg, v in vault_keys(overlap_path):
+    dirty_overlap.add((sub, rg, v))
+
+dirty_old = set()
+for sub, rg, v in vault_keys(old_path):
+    dirty_old.add((sub, rg, v))
+
+all_dirty = dirty_overlap | dirty_old
+
+with open(dirty_path, "w", newline="") as df:
+    dw = csv.writer(df)
+    dw.writerow(["subscription", "resourceGroup", "vaultName", "reason"])
+    for sub, rg, v in sorted(all_dirty):
+        reasons = []
+        if (sub, rg, v) in dirty_overlap:
+            reasons.append("no-policy-no-expiry")
+        if (sub, rg, v) in dirty_old:
+            reasons.append("old-no-expiry-rps")
+        dw.writerow([sub, rg, v, ";".join(reasons)])
+
+dirty_set = all_dirty
+
+with open(vaults_path, newline="") as vf, open(clean_path, "w", newline="") as cf:
+    r = csv.reader(vf, delimiter="\t")
+    cw = csv.writer(cf)
+    cw.writerow(["subscription", "resourceGroup", "vaultName"])
+    for row in r:
+        if len(row) < 3:
+            continue
+        sub, rg, v = row[0], row[1], row[2]
+        if (sub, rg, v) not in dirty_set:
+            cw.writerow([sub, rg, v])
+PY
 
 DIRTY_COUNT=$(tail -n +2 "$CSV_DIRTY" | wc -l | tr -d ' ')
 CLEAN_COUNT=$(tail -n +2 "$CSV_CLEAN" | wc -l | tr -d ' ')
@@ -484,17 +574,9 @@ echo ""
 # =============================================================================
 # SUMMARY
 # =============================================================================
-# Count breakdowns
+# Count breakdowns (OVERLAP_RP_SUM is set from Phase 3 stdout)
 NP_VM_COUNT=$(tail -n +2 "$CSV_NO_POLICY" | grep -i 'AzureIaasVM' | wc -l | tr -d ' ')
 NP_OTHER_COUNT=$((PHASE2_COUNT - NP_VM_COUNT))
-OVERLAP_RP_TOTAL=0
-for V in "${RP_COUNTS[@]}"; do OVERLAP_RP_TOTAL=$((OVERLAP_RP_TOTAL + V)); done 2>/dev/null
-# Only count overlap RPs
-OVERLAP_RP_SUM=0
-while IFS=',' read -r _ _ _ _ _ _ _ CNT _; do
-  CNT_CLEAN=$(echo "$CNT" | sed 's/"//g')
-  OVERLAP_RP_SUM=$((OVERLAP_RP_SUM + CNT_CLEAN))
-done < <(tail -n +2 "$CSV_OVERLAP")
 
 # Unique vaults with no-expiry RPs
 VAULTS_WITH_NOEXPIRY=$(tail -n +2 "$CSV_NO_EXPIRY" | awk -F',' '{print $3}' | sort -u | wc -l | tr -d ' ')
