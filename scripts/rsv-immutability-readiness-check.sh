@@ -5,12 +5,15 @@
 # All CSVs are written on-the-fly so partial data survives crashes.
 #
 # Output files (in ../rsv-reports/ one level above repo, timestamped):
-#   1) no-expiry-rps-YYYYMMDD-HHMMSS.csv        — All recovery points with no expiry date
-#   2) no-policy-items-YYYYMMDD-HHMMSS.csv      — Backup items with no policy assigned
-#   3) no-expiry-no-policy-YYYYMMDD-HHMMSS.csv  — Items in BOTH (the real risk)
-#   4) old-no-expiry-rps-YYYYMMDD-HHMMSS.csv    — No-expiry RPs older than RP_AGE_MONTHS
-#   5) clean-vaults-YYYYMMDD-HHMMSS.csv         — Vaults not appearing in reports 3 or 4
-#   6) dirty-vaults-YYYYMMDD-HHMMSS.csv         — Vaults appearing in report 3 or 4
+#   1) no-expiry-rps-YYYYMMDD-HHMMSS.csv        — Recovery points with null expiryTime (after SKIP_RECENT_HOURS)
+#   2) no-policy-items-YYYYMMDD-HHMMSS.csv      — Backup items with no policy assigned (ARG)
+#   3) no-expiry-no-policy-YYYYMMDD-HHMMSS.csv   — Items in BOTH 1∩2 — primary lock risk
+#   4) old-rps-YYYYMMDD-HHMMSS.csv             — Recovery points with recoveryPointTime before RP_AGE_CUTOFF (any expiry)
+#   5) clean-vaults-YYYYMMDD-HHMMSS.csv           — Vaults in neither report 3 nor 4 (safe to review for lock)
+#   6) dirty-vaults-YYYYMMDD-HHMMSS.csv         — Vaults in report 3 OR 4 — reasons: no-policy-no-expiry and/or old-rps
+#
+# Dirty vault rule: overlap (no policy ∧ still has no-expiry RPs in this scan), OR any RP older than RP_AGE_MONTHS (report 4).
+# Report 1 still lists only null-expiry RPs; report 4 lists any RP past the age threshold (see expiryTime column).
 #
 # Usage:
 #   ./scripts/rsv-immutability-readiness-check.sh                     # default (10 parallel, skip last 48h)
@@ -80,14 +83,14 @@ if [[ "$CSV_OUTPUT" == "1" ]]; then
   CSV_NO_EXPIRY="${REPORT_DIR}/no-expiry-rps-${TS}.csv"
   CSV_NO_POLICY="${REPORT_DIR}/no-policy-items-${TS}.csv"
   CSV_OVERLAP="${REPORT_DIR}/no-expiry-no-policy-${TS}.csv"
-  CSV_OLD_RPS="${REPORT_DIR}/old-no-expiry-rps-${TS}.csv"
+  CSV_OLD_RPS="${REPORT_DIR}/old-rps-${TS}.csv"
   CSV_CLEAN="${REPORT_DIR}/clean-vaults-${TS}.csv"
   CSV_DIRTY="${REPORT_DIR}/dirty-vaults-${TS}.csv"
 else
   CSV_NO_EXPIRY="${TMPDIR_WORK}/no-expiry-rps.csv"
   CSV_NO_POLICY="${TMPDIR_WORK}/no-policy-items.csv"
   CSV_OVERLAP="${TMPDIR_WORK}/no-expiry-no-policy.csv"
-  CSV_OLD_RPS="${TMPDIR_WORK}/old-no-expiry-rps.csv"
+  CSV_OLD_RPS="${TMPDIR_WORK}/old-rps.csv"
   CSV_CLEAN="${TMPDIR_WORK}/clean-vaults.csv"
   CSV_DIRTY="${TMPDIR_WORK}/dirty-vaults.csv"
 fi
@@ -124,6 +127,7 @@ echo ""
 # PHASE 1: Recovery points with no expiry (via az CLI per-vault)
 # =============================================================================
 echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType" > "$CSV_NO_EXPIRY"
+echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,expiryTime" > "$CSV_OLD_RPS"
 
 echo "[Phase 1/4] Fetching all RSV vaults via Azure Resource Graph..."
 T1=$SECONDS
@@ -165,10 +169,12 @@ echo "[*] Scanning recovery points ($PARALLEL parallel workers)..."
 process_vault() {
   local VAULT_NUM="$1" VAULT_TOTAL="$2" SUB_ID="$3" RG="$4" VAULT_NAME="$5"
   local VAULT_TMPFILE="$TMPDIR_WORK/vault-${VAULT_NUM}.csv"
+  local VAULT_AGED_TMPFILE="$TMPDIR_WORK/vault-${VAULT_NUM}-aged.csv"
   local VAULT_LOG="$TMPDIR_WORK/vault-${VAULT_NUM}.log"
   local DEBUG="$6" VAULT_START=$SECONDS
 
   : > "$VAULT_TMPFILE"
+  : > "$VAULT_AGED_TMPFILE"
 
   echo "  [$VAULT_NUM/$VAULT_TOTAL] $VAULT_NAME (sub=$SUB_ID)" >> "$VAULT_LOG"
 
@@ -202,10 +208,9 @@ process_vault() {
   while IFS=$'\t' read -r CONTAINER_NAME ITEM_NAME FRIENDLY_CONTAINER FRIENDLY_ITEM; do
     ITEM_NUM=$((ITEM_NUM + 1))
 
+    local RAW_RP
     if [[ "$DEBUG" == "1" ]]; then
       echo "    [$ITEM_NUM/$ITEM_COUNT] $FRIENDLY_ITEM" >> "$VAULT_LOG"
-
-      local RAW_RP
       RAW_RP=$(az backup recoverypoint list \
         --subscription "$SUB_ID" \
         --resource-group "$RG" \
@@ -220,12 +225,8 @@ process_vault() {
         echo "      [!] Invalid JSON: ${RAW_RP:0:200}" >> "$VAULT_LOG"
         continue
       fi
-
-      local NO_EXPIRY
-      NO_EXPIRY=$(echo "$RAW_RP" | jq -r '.[] | select(.properties.recoveryPointProperties.expiryTime == null) | [.name, .properties.recoveryPointTime, .properties.recoveryPointType] | @tsv' 2>/dev/null | tr -d '\r') || true
     else
-      local NO_EXPIRY
-      NO_EXPIRY=$(az backup recoverypoint list \
+      RAW_RP=$(az backup recoverypoint list \
         --subscription "$SUB_ID" \
         --resource-group "$RG" \
         --vault-name "$VAULT_NAME" \
@@ -233,26 +234,40 @@ process_vault() {
         --item-name "$FRIENDLY_ITEM" \
         --backup-management-type AzureIaasVM \
         --workload-type VM \
-        --query "[?properties.recoveryPointProperties.expiryTime==null].{name:name, recoveryPointTime:properties.recoveryPointTime, type:properties.recoveryPointType}" \
-        -o tsv 2>/dev/null | tr -d '\r') || continue
-    fi
+        -o json 2>/dev/null) || continue
 
-    [[ -z "$NO_EXPIRY" ]] && continue
-
-    while IFS=$'\t' read -r RP_NAME RP_TIME RP_TYPE; do
-      if [[ -n "$CUTOFF_TS" && "$RP_TIME" > "$CUTOFF_TS" ]]; then
-        [[ "$DEBUG" == "1" ]] && echo "      [skip] $RP_NAME ($RP_TIME) — newer than cutoff" >> "$VAULT_LOG"
+      if ! echo "$RAW_RP" | jq empty 2>/dev/null; then
         continue
       fi
-      echo "    [!] Found: $FRIENDLY_ITEM / $RP_NAME ($RP_TIME)" >> "$VAULT_LOG"
-      echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\",\"$ITEM_NAME\",\"$RP_TIME\",\"$RP_TYPE\"" >> "$VAULT_TMPFILE"
-    done <<< "$NO_EXPIRY"
+    fi
+
+    # Report 4: any RP older than RP_AGE_CUTOFF (compare first 19 chars so Z/fractions vs cutoff align)
+    echo "$RAW_RP" | jq -r --arg ac "$RP_AGE_CUTOFF" --arg sub "$SUB_ID" --arg rg "$RG" --arg vault "$VAULT_NAME" --arg item "$ITEM_NAME" '
+      def head19: if type == "string" and length >= 19 then .[0:19] else . end;
+      .[] | select(.properties.recoveryPointTime != null and (.properties.recoveryPointTime | type == "string")
+        and ((.properties.recoveryPointTime | head19) < ($ac | head19)))
+      | [$sub, $rg, $vault, $item, .properties.recoveryPointTime, (.properties.recoveryPointType // ""), (.properties.recoveryPointProperties.expiryTime // "")] | @csv
+    ' >> "$VAULT_AGED_TMPFILE" 2>/dev/null || true
+
+    local NO_EXPIRY
+    NO_EXPIRY=$(echo "$RAW_RP" | jq -r '.[] | select(.properties.recoveryPointProperties.expiryTime == null) | [.name, .properties.recoveryPointTime, .properties.recoveryPointType] | @tsv' 2>/dev/null | tr -d '\r') || true
+
+    if [[ -n "$NO_EXPIRY" ]]; then
+      while IFS=$'\t' read -r RP_NAME RP_TIME RP_TYPE; do
+        if [[ -n "$CUTOFF_TS" && "$RP_TIME" > "$CUTOFF_TS" ]]; then
+          [[ "$DEBUG" == "1" ]] && echo "      [skip] $RP_NAME ($RP_TIME) — newer than cutoff" >> "$VAULT_LOG"
+          continue
+        fi
+        echo "    [!] Found: $FRIENDLY_ITEM / $RP_NAME ($RP_TIME)" >> "$VAULT_LOG"
+        echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\",\"$ITEM_NAME\",\"$RP_TIME\",\"$RP_TYPE\"" >> "$VAULT_TMPFILE"
+      done <<< "$NO_EXPIRY"
+    fi
 
   done <<< "$ITEM_LINES"
 }
 
 export -f process_vault
-export TMPDIR_WORK CUTOFF_TS
+export TMPDIR_WORK CUTOFF_TS RP_AGE_CUTOFF
 
 VAULT_NUM=0
 ACTIVE_PIDS=()
@@ -271,6 +286,7 @@ merge_completed_workers() {
       vn="${PID_TO_VAULT_NUM[$pid]}"
       if [[ -n "$vn" && -z "${MERGED_VAULT_CSV[$vn]}" ]]; then
         [[ -s "$TMPDIR_WORK/vault-${vn}.csv" ]] && cat "$TMPDIR_WORK/vault-${vn}.csv" >> "$CSV_NO_EXPIRY"
+        [[ -s "$TMPDIR_WORK/vault-${vn}-aged.csv" ]] && cat "$TMPDIR_WORK/vault-${vn}-aged.csv" >> "$CSV_OLD_RPS"
         MERGED_VAULT_CSV[$vn]=1
       fi
       wait "$pid" 2>/dev/null || true
@@ -338,19 +354,15 @@ done
 wait 2>/dev/null
 printf "\r  [%d/%d vaults completed, 0 active workers]          \n" "$VAULT_COUNT" "$VAULT_COUNT"
 
-# Catch any vault file not merged yet (should be rare)
-echo "[*] Finalizing ${CSV_NO_EXPIRY##*/}..."
+# Catch any vault worker output not merged yet (should be rare)
+echo "[*] Finalizing ${CSV_NO_EXPIRY##*/} and ${CSV_OLD_RPS##*/}..."
 T_MERGE=$SECONDS
-shopt -s nullglob
-for _f in $(printf '%s\n' "$TMPDIR_WORK"/vault-*.csv 2>/dev/null | LC_ALL=C sort -V); do
-  [[ -s "$_f" ]] || continue
-  _bn=$(basename "$_f" .csv)
-  _vn="${_bn#vault-}"
-  [[ -n "${MERGED_VAULT_CSV[$_vn]}" ]] && continue
-  cat "$_f" >> "$CSV_NO_EXPIRY"
-  MERGED_VAULT_CSV[$_vn]=1
+for ((FIN_VN=1; FIN_VN<=VAULT_NUM; FIN_VN++)); do
+  [[ -n "${MERGED_VAULT_CSV[$FIN_VN]}" ]] && continue
+  [[ -s "$TMPDIR_WORK/vault-${FIN_VN}.csv" ]] && cat "$TMPDIR_WORK/vault-${FIN_VN}.csv" >> "$CSV_NO_EXPIRY"
+  [[ -s "$TMPDIR_WORK/vault-${FIN_VN}-aged.csv" ]] && cat "$TMPDIR_WORK/vault-${FIN_VN}-aged.csv" >> "$CSV_OLD_RPS"
+  MERGED_VAULT_CSV[$FIN_VN]=1
 done
-shopt -u nullglob
 echo "[*] Finalize done ($(format_time $((SECONDS - T_MERGE))))"
 
 # Report timeouts
@@ -362,41 +374,9 @@ if [[ -f "$TMPDIR_WORK/timeouts.log" ]]; then
 fi
 
 PHASE1_COUNT=$(tail -n +2 "$CSV_NO_EXPIRY" | wc -l | tr -d ' ')
-PHASE1_TIME=$((SECONDS - T1))
-echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs found ($(format_time $PHASE1_TIME))"
-echo ""
-
-# =============================================================================
-# PHASE 1.5: No-expiry RPs older than RP_AGE_MONTHS
-# =============================================================================
-echo "[*] Filtering no-expiry RPs older than ${RP_AGE_MONTHS} months..."
-T15=$SECONDS
-
-python3 - "$RP_AGE_CUTOFF" "$CSV_NO_EXPIRY" "$CSV_OLD_RPS" <<'PY'
-import csv
-import sys
-
-cutoff, inp_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
-written = 0
-with open(inp_path, newline="") as inf, open(out_path, "w", newline="") as outf:
-    reader = csv.reader(inf)
-    writer = csv.writer(outf)
-    header = next(reader)
-    writer.writerow(header)
-    for row in reader:
-        if len(row) < 6:
-            continue
-        rp_time = row[4]
-        # ISO-8601 timestamps sort/compare lexicographically as chronology for normal formats
-        if rp_time < cutoff:
-            writer.writerow(row)
-            written += 1
-            if written % 50000 == 0:
-                print(f"  ... wrote {written} old RP rows", file=sys.stderr)
-PY
-
 OLD_RP_COUNT=$(tail -n +2 "$CSV_OLD_RPS" | wc -l | tr -d ' ')
-echo "[*] Found $OLD_RP_COUNT no-expiry RPs older than ${RP_AGE_MONTHS} months ($(format_time $((SECONDS - T15))))"
+PHASE1_TIME=$((SECONDS - T1))
+echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs (report 1); $OLD_RP_COUNT RPs older than ${RP_AGE_MONTHS} months / any expiry (report 4) ($(format_time $PHASE1_TIME))"
 echo ""
 
 # =============================================================================
@@ -524,7 +504,7 @@ echo "[*] Phase 3 done: $OVERLAP_COUNT items with no policy AND no-expiry RPs ($
 echo ""
 
 # =============================================================================
-# PHASE 4: Clean and Dirty vault classification
+# PHASE 4: Vault classification — dirty iff vault appears in CSV #3 OR #4 (union)
 # =============================================================================
 echo "[Phase 4/4] Classifying clean and dirty vaults..."
 T4=$SECONDS
@@ -566,7 +546,7 @@ with open(dirty_path, "w", newline="") as df:
         if (sub, rg, v) in dirty_overlap:
             reasons.append("no-policy-no-expiry")
         if (sub, rg, v) in dirty_old:
-            reasons.append("old-no-expiry-rps")
+            reasons.append("old-rps")
         dw.writerow([sub, rg, v, ";".join(reasons)])
 
 dirty_set = all_dirty
@@ -619,12 +599,12 @@ echo "  ── Phase 3: RISK — No Policy + No Expiry ────"
 printf "  %-45s %s\n" "Items with no policy AND no-expiry RPs:" "$OVERLAP_COUNT"
 printf "  %-45s %s\n" "Total no-expiry RPs for those items:" "$OVERLAP_RP_SUM"
 echo ""
-echo "  ── Old No-Expiry RPs (>${RP_AGE_MONTHS} months) ──────"
-printf "  %-45s %s\n" "No-expiry RPs older than ${RP_AGE_MONTHS} months:" "$OLD_RP_COUNT"
+echo "  ── RPs older than RP age threshold (report 4, any expiry) ──"
+printf "  %-45s %s\n" "Recovery points before ${RP_AGE_CUTOFF}:" "$OLD_RP_COUNT"
 echo ""
 echo "  ── Phase 4: Vault Classification ─────────────"
 printf "  %-45s %s\n" "Clean vaults (not in reports 3 or 4):" "$CLEAN_COUNT"
-printf "  %-45s %s\n" "Dirty vaults (in report 3 or 4):" "$DIRTY_COUNT"
+printf "  %-45s %s\n" "Dirty vaults (overlap and/or old RPs):" "$DIRTY_COUNT"
 echo ""
 if [[ "$OVERLAP_COUNT" -gt 0 ]]; then
   echo "  ⚠  ACTION REQUIRED before locking immutability!"
