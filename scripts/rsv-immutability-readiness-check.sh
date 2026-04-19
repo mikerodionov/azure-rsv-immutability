@@ -24,7 +24,8 @@
 #
 # Notes:
 #   - Default PARALLEL=10 balances throughput vs Azure API throttling; raising it often slows runs.
-#   - Phase 1 writes per-worker temp CSVs then merges once (parallel >> to one file can corrupt CSVs).
+#   - Phase 1: each worker writes vault-N.csv only; parent appends to the main CSV when that worker exits
+#     (single-writer — safe; parallel >> to one file would corrupt CSVs).
 #   - Requires python3 for CSV phases (RFC-safe parsing); az, jq, bash 4+ as before.
 # ===================================================================================================
 set -e
@@ -257,6 +258,26 @@ VAULT_NUM=0
 ACTIVE_PIDS=()
 declare -A PID_START_TIMES
 declare -A PID_VAULT_NAMES
+declare -A PID_TO_VAULT_NUM
+declare -A MERGED_VAULT_CSV
+
+# When a worker exits, append its temp file once (parent only — keeps no-expiry CSV populated during the run).
+merge_completed_workers() {
+  local NEW_PIDS=() pid vn
+  for pid in "${ACTIVE_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      NEW_PIDS+=("$pid")
+    else
+      vn="${PID_TO_VAULT_NUM[$pid]}"
+      if [[ -n "$vn" && -z "${MERGED_VAULT_CSV[$vn]}" ]]; then
+        [[ -s "$TMPDIR_WORK/vault-${vn}.csv" ]] && cat "$TMPDIR_WORK/vault-${vn}.csv" >> "$CSV_NO_EXPIRY"
+        MERGED_VAULT_CSV[$vn]=1
+      fi
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  ACTIVE_PIDS=("${NEW_PIDS[@]}")
+}
 
 print_progress() {
   local ACTIVE=0
@@ -290,17 +311,12 @@ while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
   ACTIVE_PIDS+=($WORKER_PID)
   PID_START_TIMES[$WORKER_PID]=$SECONDS
   PID_VAULT_NAMES[$WORKER_PID]="$VAULT_NAME"
+  PID_TO_VAULT_NUM[$WORKER_PID]=$VAULT_NUM
   disown "$WORKER_PID" 2>/dev/null
 
   while [[ ${#ACTIVE_PIDS[@]} -ge $PARALLEL ]]; do
     kill_stale_workers
-    NEW_PIDS=()
-    for PID in "${ACTIVE_PIDS[@]}"; do
-      if kill -0 "$PID" 2>/dev/null; then
-        NEW_PIDS+=("$PID")
-      fi
-    done
-    ACTIVE_PIDS=("${NEW_PIDS[@]}")
+    merge_completed_workers
     if [[ ${#ACTIVE_PIDS[@]} -ge $PARALLEL ]]; then
       print_progress
       sleep 2
@@ -312,10 +328,8 @@ done <<< "$ALL_VAULTS"
 # Wait for remaining workers to finish
 while true; do
   kill_stale_workers
-  STILL_RUNNING=0
-  for PID in "${ACTIVE_PIDS[@]}"; do
-    kill -0 "$PID" 2>/dev/null && STILL_RUNNING=$((STILL_RUNNING + 1))
-  done
+  merge_completed_workers
+  STILL_RUNNING=${#ACTIVE_PIDS[@]}
   [[ $STILL_RUNNING -eq 0 ]] && break
   local_done=$((VAULT_NUM - STILL_RUNNING))
   printf "\r  [%d/%d vaults completed, %d active workers]" "$local_done" "$VAULT_COUNT" "$STILL_RUNNING"
@@ -324,17 +338,20 @@ done
 wait 2>/dev/null
 printf "\r  [%d/%d vaults completed, 0 active workers]          \n" "$VAULT_COUNT" "$VAULT_COUNT"
 
-# Merge per-vault rows into the main CSV (parallel appends to one file can interleave and break parsing)
-echo "[*] Merging per-vault results into ${CSV_NO_EXPIRY##*/}..."
+# Catch any vault file not merged yet (should be rare)
+echo "[*] Finalizing ${CSV_NO_EXPIRY##*/}..."
 T_MERGE=$SECONDS
 shopt -s nullglob
-mapfile -t _VAULT_CSVS < <(printf '%s\n' "$TMPDIR_WORK"/vault-*.csv 2>/dev/null | LC_ALL=C sort -V)
-for _f in "${_VAULT_CSVS[@]}"; do
+for _f in $(printf '%s\n' "$TMPDIR_WORK"/vault-*.csv 2>/dev/null | LC_ALL=C sort -V); do
   [[ -s "$_f" ]] || continue
+  _bn=$(basename "$_f" .csv)
+  _vn="${_bn#vault-}"
+  [[ -n "${MERGED_VAULT_CSV[$_vn]}" ]] && continue
   cat "$_f" >> "$CSV_NO_EXPIRY"
+  MERGED_VAULT_CSV[$_vn]=1
 done
 shopt -u nullglob
-echo "[*] Merge done ($(format_time $((SECONDS - T_MERGE))))"
+echo "[*] Finalize done ($(format_time $((SECONDS - T_MERGE))))"
 
 # Report timeouts
 if [[ -f "$TMPDIR_WORK/timeouts.log" ]]; then
