@@ -22,7 +22,7 @@ All CSVs are written on-the-fly so partial data survives crashes. Reports 1-2 ar
 - `1-no-expiry-rps-*.csv` — Recovery points with null `expiryTime` (after `SKIP_RECENT_HOURS`)
 - `2-no-policy-items-*.csv` — Backup items with no policy assigned
 - `3-no-expiry-no-policy-*.csv` — Items in **both** lists (the real risk)
-- `4-old-rps-*.csv` — Backup items whose oldest recovery point is before the RP age cutoff (`RP_AGE_MONTHS`); default source is item metadata (`oldestRecoveryPoint`)
+- `4-old-rps-*.csv` — Recovery points whose `recoveryPointTime` is before the RP age cutoff (`RP_AGE_MONTHS`); includes **any** RP (expiry column shows null or date)
 - `5-clean-vaults-*.csv` — Vaults not appearing in reports 3, 4, or 7
 - `6-dirty-vaults-*.csv` — Vaults appearing in report 3, report 4, or timeout report (with reason)
 - `7-timed-out-vaults-*.csv` — Vault workers killed after `VAULT_TIMEOUT`; treated as `dirty` with reason `timeout`
@@ -31,7 +31,7 @@ All CSVs are written on-the-fly so partial data survives crashes. Reports 1-2 ar
 
 ### Clean vs dirty vaults
 
-**Report 1** lists only recovery points **without** an expiry (`expiryTime` null), optionally skipping the last `SKIP_RECENT_HOURS`. **Report 4** (default mode) flags backup items where item metadata indicates the oldest RP is older than `RP_AGE_MONTHS`; this drives the “retention / hygiene” bucket for vault locking.
+**Report 1** lists only recovery points **without** an expiry (`expiryTime` null), optionally skipping the last `SKIP_RECENT_HOURS`. **Report 4** lists recovery points **older than `RP_AGE_MONTHS`** by `recoveryPointTime`, **whether or not** they have retention expiry — this drives the “retention / hygiene” bucket for vault locking.
 
 **Dirty** — a vault in **`dirty-vaults-*.csv`** if **any**:
 
@@ -70,9 +70,6 @@ DEBUG=1 DEBUG_MAX=1 ./scripts/rsv-immutability-readiness-check.sh
 # set old RP threshold to 6 months instead of default 13
 RP_AGE_MONTHS=6 ./scripts/rsv-immutability-readiness-check.sh
 
-# legacy mode: derive old RPs by scanning all recovery points (slower)
-OLD_RPS_SOURCE=rp-scan ./scripts/rsv-immutability-readiness-check.sh
-
 # summary only, no CSV files
 CSV_OUTPUT=0 ./scripts/rsv-immutability-readiness-check.sh
 
@@ -94,7 +91,6 @@ AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 ./scripts/rs
 - `PARALLEL` (default `10`) — Parallel vault workers (raising this often worsens Azure API throttling)
 - `SKIP_RECENT_HOURS` (default `48`) — Skip no-expiry RPs newer than this in **report 1** (set `0` to include all)
 - `RP_AGE_MONTHS` (default `13`) — Recovery points older than this appear in **report 4** and mark vaults dirty
-- `OLD_RPS_SOURCE` (default `item-oldest`) — Source for report 4 age detection: `item-oldest` (faster) or `rp-scan` (legacy, slower)
 - `CSV_OUTPUT` (default `1`) — Set `0` to disable CSV file generation (summary only)
 - `VAULT_TIMEOUT` (default `600`) — Seconds before a stuck vault worker is killed (10 min)
 - `RETRY_VAULTS_CSV` (default empty) — Optional CSV path (`subscription,resourceGroup,vaultName`) to scan only the listed vaults

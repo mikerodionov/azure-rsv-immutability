@@ -25,7 +25,6 @@
 #   DEBUG=1 ./scripts/rsv-immutability-readiness-check.sh             # debug (3 vaults, verbose)
 #   DEBUG=1 DEBUG_MAX=1 ./scripts/rsv-immutability-readiness-check.sh # debug 1 vault
 #   RP_AGE_MONTHS=6 ./scripts/rsv-immutability-readiness-check.sh     # old RPs threshold: 6 months
-#   OLD_RPS_SOURCE=rp-scan ./scripts/rsv-immutability-readiness-check.sh # legacy: derive old RPs from full RP scan
 #   CSV_OUTPUT=0 ./scripts/rsv-immutability-readiness-check.sh        # summary only, no CSV files
 #   VAULT_TIMEOUT=600 ./scripts/rsv-immutability-readiness-check.sh   # 10min timeout per vault
 #   RETRY_VAULTS_CSV=../rsv-reports/7-timed-out-vaults-*.csv PARALLEL=5 VAULT_TIMEOUT=1200 ./scripts/rsv-immutability-readiness-check.sh
@@ -52,7 +51,6 @@ AUTO_RETRY_TIMEOUTS="${AUTO_RETRY_TIMEOUTS:-1}"
 AUTO_RETRY_PARALLEL="${AUTO_RETRY_PARALLEL:-5}"
 AUTO_RETRY_TIMEOUT="${AUTO_RETRY_TIMEOUT:-1200}"
 RETRY_RESULT_META="${RETRY_RESULT_META:-}"
-OLD_RPS_SOURCE="${OLD_RPS_SOURCE:-item-oldest}"
 
 # ---- Helper: human-readable elapsed time ----
 format_time() {
@@ -133,7 +131,6 @@ RP_AGE_CUTOFF=$(date -u -d "${RP_AGE_MONTHS} months ago" +%Y-%m-%dT%H:%M:%S 2>/d
   || date -u -v-${RP_AGE_MONTHS}m +%Y-%m-%dT%H:%M:%S)
 echo "[*] Old RP threshold: ${RP_AGE_MONTHS} months (before $RP_AGE_CUTOFF)"
 echo "[*] Per-vault timeout: ${VAULT_TIMEOUT}s"
-echo "[*] Old RP source: ${OLD_RPS_SOURCE}"
 if [[ -z "$RETRY_VAULTS_CSV" && "$AUTO_RETRY_TIMEOUTS" == "1" ]]; then
   echo "[*] Auto timeout retry: enabled (PARALLEL=${AUTO_RETRY_PARALLEL}, VAULT_TIMEOUT=${AUTO_RETRY_TIMEOUT}s)"
 fi
@@ -255,24 +252,12 @@ process_vault() {
     .properties.containerName,
     .name,
     (.properties.containerName | split(";") | last),
-    (.name | split(";") | last),
-    (
-      .properties.extendedInfo.oldestRecoveryPoint
-      // .properties.oldestRecoveryPoint
-      // ""
-    )
+    (.name | split(";") | last)
   ] | @tsv' | tr -d '\r')
 
   local ITEM_NUM=0
-  while IFS=$'\t' read -r CONTAINER_NAME ITEM_NAME FRIENDLY_CONTAINER FRIENDLY_ITEM ITEM_OLDEST_RP; do
+  while IFS=$'\t' read -r CONTAINER_NAME ITEM_NAME FRIENDLY_CONTAINER FRIENDLY_ITEM; do
     ITEM_NUM=$((ITEM_NUM + 1))
-
-    # Report 4 fast path: use item-level oldest RP metadata when available.
-    if [[ "$OLD_RPS_SOURCE" == "item-oldest" ]]; then
-      if [[ -n "$ITEM_OLDEST_RP" && "${ITEM_OLDEST_RP:0:19}" < "${RP_AGE_CUTOFF:0:19}" ]]; then
-        echo "\"$SUB_ID\",\"$RG\",\"$VAULT_NAME\",\"$ITEM_NAME\",\"$ITEM_OLDEST_RP\",\"item-oldest-metadata\",\"\"" >> "$VAULT_AGED_TMPFILE"
-      fi
-    fi
 
     local RAW_RP
     if [[ "$DEBUG" == "1" ]]; then
@@ -307,15 +292,13 @@ process_vault() {
       fi
     fi
 
-    # Report 4 legacy path: derive old RPs by scanning all RPs.
-    if [[ "$OLD_RPS_SOURCE" == "rp-scan" ]]; then
-      echo "$RAW_RP" | jq -r --arg ac "$RP_AGE_CUTOFF" --arg sub "$SUB_ID" --arg rg "$RG" --arg vault "$VAULT_NAME" --arg item "$ITEM_NAME" '
-        def head19: if type == "string" and length >= 19 then .[0:19] else . end;
-        .[] | select(.properties.recoveryPointTime != null and (.properties.recoveryPointTime | type == "string")
-          and ((.properties.recoveryPointTime | head19) < ($ac | head19)))
-        | [$sub, $rg, $vault, $item, .properties.recoveryPointTime, (.properties.recoveryPointType // ""), (.properties.recoveryPointProperties.expiryTime // "")] | @csv
-      ' >> "$VAULT_AGED_TMPFILE" 2>/dev/null || true
-    fi
+    # Report 4: any RP older than RP_AGE_CUTOFF (compare first 19 chars so Z/fractions vs cutoff align)
+    echo "$RAW_RP" | jq -r --arg ac "$RP_AGE_CUTOFF" --arg sub "$SUB_ID" --arg rg "$RG" --arg vault "$VAULT_NAME" --arg item "$ITEM_NAME" '
+      def head19: if type == "string" and length >= 19 then .[0:19] else . end;
+      .[] | select(.properties.recoveryPointTime != null and (.properties.recoveryPointTime | type == "string")
+        and ((.properties.recoveryPointTime | head19) < ($ac | head19)))
+      | [$sub, $rg, $vault, $item, .properties.recoveryPointTime, (.properties.recoveryPointType // ""), (.properties.recoveryPointProperties.expiryTime // "")] | @csv
+    ' >> "$VAULT_AGED_TMPFILE" 2>/dev/null || true
 
     local NO_EXPIRY
     NO_EXPIRY=$(echo "$RAW_RP" | jq -r '.[] | select(.properties.recoveryPointProperties.expiryTime == null) | [.name, .properties.recoveryPointTime, .properties.recoveryPointType] | @tsv' 2>/dev/null | tr -d '\r') || true
@@ -453,11 +436,7 @@ fi
 PHASE1_COUNT=$(tail -n +2 "$CSV_NO_EXPIRY" | wc -l | tr -d ' ')
 OLD_RP_COUNT=$(tail -n +2 "$CSV_OLD_RPS" | wc -l | tr -d ' ')
 PHASE1_TIME=$((SECONDS - T1))
-if [[ "$OLD_RPS_SOURCE" == "item-oldest" ]]; then
-  echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs (report 1); $OLD_RP_COUNT backup items with oldest RP older than ${RP_AGE_MONTHS} months (report 4) ($(format_time $PHASE1_TIME))"
-else
-  echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs (report 1); $OLD_RP_COUNT RPs older than ${RP_AGE_MONTHS} months / any expiry (report 4) ($(format_time $PHASE1_TIME))"
-fi
+echo "[*] Phase 1 done: $PHASE1_COUNT no-expiry RPs (report 1); $OLD_RP_COUNT RPs older than ${RP_AGE_MONTHS} months / any expiry (report 4) ($(format_time $PHASE1_TIME))"
 echo ""
 
 # =============================================================================
@@ -685,11 +664,7 @@ printf "  %-45s %s\n" "Items with no policy AND no-expiry RPs:" "$OVERLAP_COUNT"
 printf "  %-45s %s\n" "Affected vaults (no-policy + no-expiry):" "$OVERLAP_VAULT_COUNT"
 echo ""
 echo "  ── RPs older than RP age threshold (report 4, any expiry) ──"
-if [[ "$OLD_RPS_SOURCE" == "item-oldest" ]]; then
-  printf "  %-45s %s\n" "Backup items with oldest RP before ${RP_AGE_CUTOFF}:" "$OLD_RP_COUNT"
-else
-  printf "  %-45s %s\n" "Recovery points before ${RP_AGE_CUTOFF}:" "$OLD_RP_COUNT"
-fi
+printf "  %-45s %s\n" "Recovery points before ${RP_AGE_CUTOFF}:" "$OLD_RP_COUNT"
 echo ""
 echo "  ── Phase 4: Vault Classification ─────────────"
 printf "  %-45s %s\n" "Clean vaults (not in reports 3, 4, or 7):" "$CLEAN_COUNT"
