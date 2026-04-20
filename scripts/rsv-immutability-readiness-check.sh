@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================================================================
 # RSV Immutability Readiness Check
-# Produces up to 6 CSVs + summary table to assess readiness for vault locking.
+# Produces up to 7 CSVs + summary table to assess readiness for vault locking.
 # All CSVs are written on-the-fly so partial data survives crashes.
 #
 # Output files (in ../rsv-reports/ one level above repo, timestamped):
@@ -10,7 +10,10 @@
 #   3) no-expiry-no-policy-YYYYMMDD-HHMMSS.csv   — Items in BOTH 1∩2 — primary lock risk
 #   4) old-rps-YYYYMMDD-HHMMSS.csv             — Recovery points with recoveryPointTime before RP_AGE_CUTOFF (any expiry)
 #   5) clean-vaults-YYYYMMDD-HHMMSS.csv           — Vaults in neither report 3 nor 4 (safe to review for lock)
-#   6) dirty-vaults-YYYYMMDD-HHMMSS.csv         — Vaults in report 3 OR 4 — reasons: no-policy-no-expiry and/or old-rps
+#   6) dirty-vaults-YYYYMMDD-HHMMSS.csv         — Vaults in report 3 OR 4 OR timed out — reasons include timeout
+#   7) timed-out-vaults-YYYYMMDD-HHMMSS.csv     — Vault workers killed after VAULT_TIMEOUT
+#   8) final-clean-vaults-YYYYMMDD-HHMMSS.csv   — Authoritative clean set after timeout retry reconciliation
+#   9) final-dirty-vaults-YYYYMMDD-HHMMSS.csv   — Authoritative dirty set after timeout retry reconciliation
 #
 # Dirty vault rule: overlap (no policy ∧ still has no-expiry RPs in this scan), OR any RP older than RP_AGE_MONTHS (report 4).
 # Report 1 still lists only null-expiry RPs; report 4 lists any RP past the age threshold (see expiryTime column).
@@ -24,6 +27,8 @@
 #   RP_AGE_MONTHS=6 ./scripts/rsv-immutability-readiness-check.sh     # old RPs threshold: 6 months
 #   CSV_OUTPUT=0 ./scripts/rsv-immutability-readiness-check.sh        # summary only, no CSV files
 #   VAULT_TIMEOUT=600 ./scripts/rsv-immutability-readiness-check.sh   # 10min timeout per vault
+#   RETRY_VAULTS_CSV=../rsv-reports/timed-out-vaults-*.csv PARALLEL=5 VAULT_TIMEOUT=1200 ./scripts/rsv-immutability-readiness-check.sh
+#   AUTO_RETRY_TIMEOUTS=1 ./scripts/rsv-immutability-readiness-check.sh # default: auto retry timed-out vaults once
 #
 # Notes:
 #   - Default PARALLEL=10 balances throughput vs Azure API throttling; raising it often slows runs.
@@ -41,6 +46,11 @@ SKIP_RECENT_HOURS="${SKIP_RECENT_HOURS:-48}"
 RP_AGE_MONTHS="${RP_AGE_MONTHS:-13}"
 CSV_OUTPUT="${CSV_OUTPUT:-1}"
 VAULT_TIMEOUT="${VAULT_TIMEOUT:-600}"
+RETRY_VAULTS_CSV="${RETRY_VAULTS_CSV:-}"
+AUTO_RETRY_TIMEOUTS="${AUTO_RETRY_TIMEOUTS:-1}"
+AUTO_RETRY_PARALLEL="${AUTO_RETRY_PARALLEL:-5}"
+AUTO_RETRY_TIMEOUT="${AUTO_RETRY_TIMEOUT:-1200}"
+RETRY_RESULT_META="${RETRY_RESULT_META:-}"
 
 # ---- Helper: human-readable elapsed time ----
 format_time() {
@@ -86,6 +96,9 @@ if [[ "$CSV_OUTPUT" == "1" ]]; then
   CSV_OLD_RPS="${REPORT_DIR}/old-rps-${TS}.csv"
   CSV_CLEAN="${REPORT_DIR}/clean-vaults-${TS}.csv"
   CSV_DIRTY="${REPORT_DIR}/dirty-vaults-${TS}.csv"
+  CSV_TIMEOUTS="${REPORT_DIR}/timed-out-vaults-${TS}.csv"
+  CSV_FINAL_CLEAN="${REPORT_DIR}/final-clean-vaults-${TS}.csv"
+  CSV_FINAL_DIRTY="${REPORT_DIR}/final-dirty-vaults-${TS}.csv"
 else
   CSV_NO_EXPIRY="${TMPDIR_WORK}/no-expiry-rps.csv"
   CSV_NO_POLICY="${TMPDIR_WORK}/no-policy-items.csv"
@@ -93,6 +106,9 @@ else
   CSV_OLD_RPS="${TMPDIR_WORK}/old-rps.csv"
   CSV_CLEAN="${TMPDIR_WORK}/clean-vaults.csv"
   CSV_DIRTY="${TMPDIR_WORK}/dirty-vaults.csv"
+  CSV_TIMEOUTS="${TMPDIR_WORK}/timed-out-vaults.csv"
+  CSV_FINAL_CLEAN="${TMPDIR_WORK}/final-clean-vaults.csv"
+  CSV_FINAL_DIRTY="${TMPDIR_WORK}/final-dirty-vaults.csv"
 fi
 
 echo "============================================="
@@ -115,6 +131,9 @@ RP_AGE_CUTOFF=$(date -u -d "${RP_AGE_MONTHS} months ago" +%Y-%m-%dT%H:%M:%S 2>/d
   || date -u -v-${RP_AGE_MONTHS}m +%Y-%m-%dT%H:%M:%S)
 echo "[*] Old RP threshold: ${RP_AGE_MONTHS} months (before $RP_AGE_CUTOFF)"
 echo "[*] Per-vault timeout: ${VAULT_TIMEOUT}s"
+if [[ -z "$RETRY_VAULTS_CSV" && "$AUTO_RETRY_TIMEOUTS" == "1" ]]; then
+  echo "[*] Auto timeout retry: enabled (PARALLEL=${AUTO_RETRY_PARALLEL}, VAULT_TIMEOUT=${AUTO_RETRY_TIMEOUT}s)"
+fi
 
 require_python3
 
@@ -129,32 +148,64 @@ echo ""
 echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType" > "$CSV_NO_EXPIRY"
 echo "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,expiryTime" > "$CSV_OLD_RPS"
 
-echo "[Phase 1/4] Fetching all RSV vaults via Azure Resource Graph..."
+echo "subscription,resourceGroup,vaultName,elapsedSeconds,pid" > "$CSV_TIMEOUTS"
+
+if [[ -n "$RETRY_VAULTS_CSV" ]]; then
+  echo "[Phase 1/4] Loading target vaults from RETRY_VAULTS_CSV..."
+else
+  echo "[Phase 1/4] Fetching all RSV vaults via Azure Resource Graph..."
+fi
 T1=$SECONDS
 
 ALL_VAULTS=""
-SKIP=0
-while true; do
-  PAGE_JSON=$(az graph query -q "
-  Resources
-  | where type =~ 'microsoft.recoveryservices/vaults'
-  | project subscriptionId, resourceGroup, vaultName = name
-  " --first 1000 --skip $SKIP 2>/dev/null)
-
-  PAGE_ITEMS=$(echo "$PAGE_JSON" | jq -r '.data[] | [.subscriptionId, .resourceGroup, .vaultName] | @tsv' | tr -d '\r')
-  PAGE_COUNT=$(echo "$PAGE_JSON" | jq '.data | length')
-
-  if [[ -n "$PAGE_ITEMS" ]]; then
-    if [[ -n "$ALL_VAULTS" ]]; then
-      ALL_VAULTS="$ALL_VAULTS"$'\n'"$PAGE_ITEMS"
-    else
-      ALL_VAULTS="$PAGE_ITEMS"
-    fi
+if [[ -n "$RETRY_VAULTS_CSV" ]]; then
+  if [[ ! -f "$RETRY_VAULTS_CSV" ]]; then
+    echo "[!] RETRY_VAULTS_CSV does not exist: $RETRY_VAULTS_CSV"
+    exit 1
   fi
+  ALL_VAULTS="$(python3 - "$RETRY_VAULTS_CSV" <<'PY'
+import csv
+import sys
 
-  [[ "$PAGE_COUNT" -lt 1000 ]] && break
-  SKIP=$((SKIP + 1000))
-done
+path = sys.argv[1]
+out = []
+with open(path, newline="") as f:
+    r = csv.reader(f)
+    header = next(r, [])
+    if [h.strip().lower() for h in header[:3]] != ["subscription", "resourcegroup", "vaultname"]:
+        # allow files where the first row is already data
+        if len(header) >= 3:
+            out.append("\t".join(header[:3]))
+    for row in r:
+        if len(row) >= 3:
+            out.append("\t".join(row[:3]))
+print("\n".join(out))
+PY
+)"
+else
+  SKIP=0
+  while true; do
+    PAGE_JSON=$(az graph query -q "
+    Resources
+    | where type =~ 'microsoft.recoveryservices/vaults'
+    | project subscriptionId, resourceGroup, vaultName = name
+    " --first 1000 --skip $SKIP 2>/dev/null)
+
+    PAGE_ITEMS=$(echo "$PAGE_JSON" | jq -r '.data[] | [.subscriptionId, .resourceGroup, .vaultName] | @tsv' | tr -d '\r')
+    PAGE_COUNT=$(echo "$PAGE_JSON" | jq '.data | length')
+
+    if [[ -n "$PAGE_ITEMS" ]]; then
+      if [[ -n "$ALL_VAULTS" ]]; then
+        ALL_VAULTS="$ALL_VAULTS"$'\n'"$PAGE_ITEMS"
+      else
+        ALL_VAULTS="$PAGE_ITEMS"
+      fi
+    fi
+
+    [[ "$PAGE_COUNT" -lt 1000 ]] && break
+    SKIP=$((SKIP + 1000))
+  done
+fi
 
 if [[ -z "$ALL_VAULTS" ]]; then
   echo "[!] No RSV vaults found."
@@ -273,6 +324,8 @@ VAULT_NUM=0
 ACTIVE_PIDS=()
 declare -A PID_START_TIMES
 declare -A PID_VAULT_NAMES
+declare -A PID_SUB_IDS
+declare -A PID_RESOURCE_GROUPS
 declare -A PID_TO_VAULT_NUM
 declare -A MERGED_VAULT_CSV
 
@@ -311,6 +364,7 @@ kill_stale_workers() {
       local ELAPSED=$((NOW - ${PID_START_TIMES[$PID]:-$NOW}))
       if [[ $ELAPSED -ge $VAULT_TIMEOUT ]]; then
         echo "[!] TIMEOUT: ${PID_VAULT_NAMES[$PID]} after ${ELAPSED}s (PID $PID)" >> "$TMPDIR_WORK/timeouts.log"
+        echo "\"${PID_SUB_IDS[$PID]}\",\"${PID_RESOURCE_GROUPS[$PID]}\",\"${PID_VAULT_NAMES[$PID]}\",\"${ELAPSED}\",\"$PID\"" >> "$CSV_TIMEOUTS"
         kill -9 "$PID" 2>/dev/null || true
         wait "$PID" 2>/dev/null || true
       fi
@@ -327,6 +381,8 @@ while IFS=$'\t' read -r SUB_ID RG VAULT_NAME; do
   ACTIVE_PIDS+=($WORKER_PID)
   PID_START_TIMES[$WORKER_PID]=$SECONDS
   PID_VAULT_NAMES[$WORKER_PID]="$VAULT_NAME"
+  PID_SUB_IDS[$WORKER_PID]="$SUB_ID"
+  PID_RESOURCE_GROUPS[$WORKER_PID]="$RG"
   PID_TO_VAULT_NUM[$WORKER_PID]=$VAULT_NUM
   disown "$WORKER_PID" 2>/dev/null
 
@@ -367,10 +423,14 @@ echo "[*] Finalize done ($(format_time $((SECONDS - T_MERGE))))"
 
 # Report timeouts
 if [[ -f "$TMPDIR_WORK/timeouts.log" ]]; then
-  TIMEOUT_COUNT=$(grep -c '.' "$TMPDIR_WORK/timeouts.log" 2>/dev/null || echo 0)
+  TIMEOUT_COUNT=$(tail -n +2 "$CSV_TIMEOUTS" | wc -l | tr -d ' ')
   echo "[!] $TIMEOUT_COUNT vault(s) timed out after ${VAULT_TIMEOUT}s:"
-  cat "$TMPDIR_WORK/timeouts.log"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && echo "[!] $line"
+  done < "$TMPDIR_WORK/timeouts.log"
   echo ""
+else
+  TIMEOUT_COUNT=0
 fi
 
 PHASE1_COUNT=$(tail -n +2 "$CSV_NO_EXPIRY" | wc -l | tr -d ' ')
@@ -511,11 +571,11 @@ T4=$SECONDS
 
 printf '%s\n' "$ALL_VAULTS" > "$TMPDIR_WORK/all-vaults.tsv"
 
-python3 - "$TMPDIR_WORK/all-vaults.tsv" "$CSV_OVERLAP" "$CSV_OLD_RPS" "$CSV_DIRTY" "$CSV_CLEAN" <<'PY'
+python3 - "$TMPDIR_WORK/all-vaults.tsv" "$CSV_OVERLAP" "$CSV_OLD_RPS" "$CSV_TIMEOUTS" "$CSV_DIRTY" "$CSV_CLEAN" <<'PY'
 import csv
 import sys
 
-vaults_path, overlap_path, old_path, dirty_path, clean_path = sys.argv[1:6]
+vaults_path, overlap_path, old_path, timeout_path, dirty_path, clean_path = sys.argv[1:7]
 
 
 def vault_keys(csv_path: str, skip_header: bool = True):
@@ -536,7 +596,11 @@ dirty_old = set()
 for sub, rg, v in vault_keys(old_path):
     dirty_old.add((sub, rg, v))
 
-all_dirty = dirty_overlap | dirty_old
+dirty_timeout = set()
+for sub, rg, v in vault_keys(timeout_path):
+    dirty_timeout.add((sub, rg, v))
+
+all_dirty = dirty_overlap | dirty_old | dirty_timeout
 
 with open(dirty_path, "w", newline="") as df:
     dw = csv.writer(df)
@@ -547,6 +611,8 @@ with open(dirty_path, "w", newline="") as df:
             reasons.append("no-policy-no-expiry")
         if (sub, rg, v) in dirty_old:
             reasons.append("old-rps")
+        if (sub, rg, v) in dirty_timeout:
+            reasons.append("timeout")
         dw.writerow([sub, rg, v, ";".join(reasons)])
 
 dirty_set = all_dirty
@@ -605,6 +671,19 @@ echo ""
 echo "  ── Phase 4: Vault Classification ─────────────"
 printf "  %-45s %s\n" "Clean vaults (not in reports 3 or 4):" "$CLEAN_COUNT"
 printf "  %-45s %s\n" "Dirty vaults (overlap and/or old RPs):" "$DIRTY_COUNT"
+printf "  %-45s %s\n" "Timed-out vaults:" "$TIMEOUT_COUNT"
+CLASSIFIED_TOTAL=$((CLEAN_COUNT + DIRTY_COUNT))
+printf "  %-45s %s\n" "Coverage (clean + dirty):" "${CLASSIFIED_TOTAL}/${VAULT_COUNT}"
+if [[ "$CLASSIFIED_TOTAL" -eq "$VAULT_COUNT" ]]; then
+  echo "  ✓  Classification invariant holds."
+else
+  echo "  ✗  Classification invariant FAILED — investigate CSV integrity."
+fi
+if [[ "$TIMEOUT_COUNT" -gt 0 ]]; then
+  echo "  ⚠  Run status: INCOMPLETE — timed-out vaults forced to dirty/manual review."
+else
+  echo "  ✓  Run status: COMPLETE (no timed-out vaults)."
+fi
 echo ""
 if [[ "$OVERLAP_COUNT" -gt 0 ]]; then
   echo "  ⚠  ACTION REQUIRED before locking immutability!"
@@ -624,9 +703,161 @@ if [[ "$CSV_OUTPUT" == "1" ]]; then
   echo "  4) $CSV_OLD_RPS"
   echo "  5) $CSV_CLEAN"
   echo "  6) $CSV_DIRTY"
+  echo "  7) $CSV_TIMEOUTS"
 else
   echo "  (CSV output disabled — set CSV_OUTPUT=1 to generate files)"
 fi
 echo ""
 echo "  Total execution time: $(format_time $SECONDS)"
 echo "============================================="
+
+# Expose this run outputs to the caller when this script is used as a retry child.
+if [[ -n "$RETRY_RESULT_META" ]]; then
+  {
+    echo "RETRY_CHILD_CSV_CLEAN=$CSV_CLEAN"
+    echo "RETRY_CHILD_CSV_DIRTY=$CSV_DIRTY"
+    echo "RETRY_CHILD_CSV_TIMEOUTS=$CSV_TIMEOUTS"
+  } > "$RETRY_RESULT_META"
+fi
+
+# -----------------------------------------------------------------------------
+# Helper: default second pass for timed-out vaults
+# -----------------------------------------------------------------------------
+RETRY_META_FILE=""
+if [[ "$TIMEOUT_COUNT" -gt 0 && -z "$RETRY_VAULTS_CSV" && "$AUTO_RETRY_TIMEOUTS" == "1" ]]; then
+  echo ""
+  echo "[*] Helper: starting automatic retry for timed-out vaults..."
+  echo "[*] Retry input: $CSV_TIMEOUTS"
+  echo "[*] Retry settings: PARALLEL=${AUTO_RETRY_PARALLEL}, VAULT_TIMEOUT=${AUTO_RETRY_TIMEOUT}s"
+  echo ""
+  RETRY_META_FILE="$TMPDIR_WORK/retry-result-meta.env"
+  RETRY_CMD=(
+    env
+    "RETRY_VAULTS_CSV=$CSV_TIMEOUTS"
+    "PARALLEL=$AUTO_RETRY_PARALLEL"
+    "VAULT_TIMEOUT=$AUTO_RETRY_TIMEOUT"
+    "SKIP_RECENT_HOURS=$SKIP_RECENT_HOURS"
+    "RP_AGE_MONTHS=$RP_AGE_MONTHS"
+    "CSV_OUTPUT=$CSV_OUTPUT"
+    "AUTO_RETRY_TIMEOUTS=0"
+    "RETRY_RESULT_META=$RETRY_META_FILE"
+    "$0"
+  )
+  "${RETRY_CMD[@]}"
+fi
+
+# -----------------------------------------------------------------------------
+# Final authoritative reconciliation (primary runs only)
+# -----------------------------------------------------------------------------
+if [[ -z "$RETRY_VAULTS_CSV" ]]; then
+  RETRY_CLEAN_PATH=""
+  RETRY_DIRTY_PATH=""
+  RETRY_TIMEOUTS_PATH=""
+  if [[ -n "$RETRY_META_FILE" && -f "$RETRY_META_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$RETRY_META_FILE"
+    RETRY_CLEAN_PATH="${RETRY_CHILD_CSV_CLEAN:-}"
+    RETRY_DIRTY_PATH="${RETRY_CHILD_CSV_DIRTY:-}"
+    RETRY_TIMEOUTS_PATH="${RETRY_CHILD_CSV_TIMEOUTS:-}"
+  fi
+
+  python3 - "$TMPDIR_WORK/all-vaults.tsv" "$CSV_DIRTY" "$CSV_TIMEOUTS" "$RETRY_DIRTY_PATH" "$RETRY_TIMEOUTS_PATH" "$CSV_FINAL_DIRTY" "$CSV_FINAL_CLEAN" <<'PY'
+import csv
+import sys
+
+all_vaults_path, base_dirty_path, base_timeout_path, retry_dirty_path, retry_timeout_path, final_dirty_path, final_clean_path = sys.argv[1:8]
+
+def read_dirty_map(path: str):
+    out = {}
+    if not path:
+        return out
+    try:
+        with open(path, newline="") as f:
+            r = csv.reader(f)
+            next(r, None)
+            for row in r:
+                if len(row) < 4:
+                    continue
+                out[(row[0], row[1], row[2])] = row[3]
+    except FileNotFoundError:
+        pass
+    return out
+
+def read_vault_set(path: str):
+    out = set()
+    if not path:
+        return out
+    try:
+        with open(path, newline="") as f:
+            r = csv.reader(f)
+            next(r, None)
+            for row in r:
+                if len(row) >= 3:
+                    out.add((row[0], row[1], row[2]))
+    except FileNotFoundError:
+        pass
+    return out
+
+base_dirty = read_dirty_map(base_dirty_path)
+base_timed_out = read_vault_set(base_timeout_path)
+retry_dirty = read_dirty_map(retry_dirty_path)
+retry_timed_out = read_vault_set(retry_timeout_path)
+
+all_vaults = []
+with open(all_vaults_path, newline="") as f:
+    r = csv.reader(f, delimiter="\t")
+    for row in r:
+        if len(row) >= 3:
+            all_vaults.append((row[0], row[1], row[2]))
+
+final_dirty = {}
+for key in all_vaults:
+    if key in base_timed_out:
+        if key in retry_timed_out:
+            # Retried but still unresolved (or unresolved + risk findings)
+            final_dirty[key] = retry_dirty.get(key, "timeout")
+        elif key in retry_dirty:
+            # Retry succeeded and found real dirty reasons.
+            final_dirty[key] = retry_dirty[key]
+        else:
+            # Retried and no longer dirty -> clean.
+            pass
+    elif key in base_dirty:
+        final_dirty[key] = base_dirty[key]
+
+with open(final_dirty_path, "w", newline="") as df:
+    w = csv.writer(df)
+    w.writerow(["subscription", "resourceGroup", "vaultName", "reason"])
+    for key in sorted(final_dirty):
+        w.writerow([key[0], key[1], key[2], final_dirty[key]])
+
+with open(final_clean_path, "w", newline="") as cf:
+    w = csv.writer(cf)
+    w.writerow(["subscription", "resourceGroup", "vaultName"])
+    for key in all_vaults:
+        if key not in final_dirty:
+            w.writerow([key[0], key[1], key[2]])
+PY
+
+  FINAL_DIRTY_COUNT=$(tail -n +2 "$CSV_FINAL_DIRTY" | wc -l | tr -d ' ')
+  FINAL_CLEAN_COUNT=$(tail -n +2 "$CSV_FINAL_CLEAN" | wc -l | tr -d ' ')
+  FINAL_COVERAGE=$((FINAL_CLEAN_COUNT + FINAL_DIRTY_COUNT))
+
+  echo ""
+  echo "============================================="
+  echo " FINAL AUTHORITATIVE CLASSIFICATION"
+  echo "============================================="
+  printf "  %-45s %s\n" "Final clean vaults:" "$FINAL_CLEAN_COUNT"
+  printf "  %-45s %s\n" "Final dirty vaults:" "$FINAL_DIRTY_COUNT"
+  printf "  %-45s %s\n" "Final coverage (clean + dirty):" "${FINAL_COVERAGE}/${VAULT_COUNT}"
+  if [[ "$FINAL_COVERAGE" -eq "$VAULT_COUNT" ]]; then
+    echo "  ✓  Final coverage invariant holds."
+  else
+    echo "  ✗  Final coverage invariant FAILED."
+  fi
+  if [[ "$CSV_OUTPUT" == "1" ]]; then
+    echo "  Final clean file: $CSV_FINAL_CLEAN"
+    echo "  Final dirty file: $CSV_FINAL_DIRTY"
+  fi
+  echo "============================================="
+fi
