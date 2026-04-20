@@ -69,6 +69,106 @@ require_python3() {
   }
 }
 
+require_python_pip_module() {
+  local AZ_PY="/usr/bin/python3"
+  local AZ_PY_MISSING_PIP=0
+  local USER_PY_MISSING_PIP=0
+
+  if [[ -x "$AZ_PY" ]]; then
+    "$AZ_PY" -m pip --version >/dev/null 2>&1 || AZ_PY_MISSING_PIP=1
+  else
+    AZ_PY_MISSING_PIP=1
+  fi
+
+  python3 -m pip --version >/dev/null 2>&1 || USER_PY_MISSING_PIP=1
+
+  if [[ "$AZ_PY_MISSING_PIP" -eq 0 && "$USER_PY_MISSING_PIP" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$AZ_PY_MISSING_PIP" -eq 1 ]]; then
+    echo "[!] Azure CLI extension install uses ${AZ_PY}, but pip is missing for that interpreter." >&2
+    echo "[!] Missing requirement: ${AZ_PY} -m pip" >&2
+  elif [[ "$USER_PY_MISSING_PIP" -eq 1 ]]; then
+    echo "[!] python3 is present, but the pip module is missing for your shell interpreter." >&2
+    echo "[!] Missing requirement: python3 -m pip" >&2
+  fi
+  echo "[!] Install pip for your OS, then rerun." >&2
+
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in
+      fedora|rhel|centos|rocky|almalinux)
+        echo "[!] Suggested fix (${ID}): sudo dnf install -y python3-pip" >&2
+        ;;
+      ubuntu|debian|linuxmint|pop)
+        echo "[!] Suggested fix (${ID}): sudo apt-get update && sudo apt-get install -y python3-pip" >&2
+        ;;
+      opensuse*|sles)
+        echo "[!] Suggested fix (${ID}): sudo zypper install -y python3-pip" >&2
+        ;;
+      alpine)
+        echo "[!] Suggested fix (${ID}): sudo apk add py3-pip" >&2
+        ;;
+      arch|manjaro)
+        echo "[!] Suggested fix (${ID}): sudo pacman -Sy --noconfirm python-pip" >&2
+        ;;
+      *)
+        echo "[!] Suggested fix: install package providing 'python3 -m pip' for your distro." >&2
+        ;;
+    esac
+  else
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+      Darwin)
+        echo "[!] Suggested fix (macOS): brew install python" >&2
+        ;;
+      *)
+        echo "[!] Suggested fix: install package providing 'python3 -m pip' for your OS." >&2
+        ;;
+    esac
+  fi
+
+  exit 1
+}
+
+require_azure_graph_ready() {
+  command -v az >/dev/null 2>&1 || {
+    echo "[!] Azure CLI (az) is required." >&2
+    exit 1
+  }
+
+  az account show >/dev/null 2>&1 || {
+    echo "[!] Azure CLI is not authenticated. Run: az login" >&2
+    exit 1
+  }
+
+  # Ensure ARG extension is available to avoid hidden interactive prompts later.
+  if ! az extension show -n resource-graph >/dev/null 2>&1; then
+    echo "[*] Installing Azure CLI extension: resource-graph ..."
+    # Force non-interactive extension behavior for private/local tenants.
+    az config set extension.use_dynamic_install=yes_without_prompt >/dev/null 2>&1 || true
+    az config set extension.dynamic_install_allow_preview=false >/dev/null 2>&1 || true
+    local EXT_ERR="$TMPDIR_WORK/az-resource-graph-install.err"
+    az extension add -n resource-graph --allow-preview false --only-show-errors >/dev/null 2>"$EXT_ERR" || {
+      echo "[!] Failed to install resource-graph extension." >&2
+      if [[ -s "$EXT_ERR" ]]; then
+        echo "[!] Azure CLI output (install failure):" >&2
+        sed -n '1,8p' "$EXT_ERR" >&2
+      fi
+      echo "[!] Install manually: az extension add -n resource-graph" >&2
+      exit 1
+    }
+  fi
+
+  # Fail fast with a clear message if ARG itself is unavailable.
+  az graph query -q "Resources | project id | limit 1" --first 1 >/dev/null 2>&1 || {
+    echo "[!] Azure Resource Graph query failed." >&2
+    echo "[!] Verify subscription access/permissions and extension state." >&2
+    exit 1
+  }
+}
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPORT_DIR="$(cd "$REPO_ROOT/.." && pwd)/rsv-reports"
 mkdir -p "$REPORT_DIR"
@@ -136,6 +236,8 @@ if [[ -z "$RETRY_VAULTS_CSV" && "$AUTO_RETRY_TIMEOUTS" == "1" ]]; then
 fi
 
 require_python3
+require_python_pip_module
+require_azure_graph_ready
 
 if [[ "$DEBUG" == "1" ]]; then
   echo "[*] DEBUG MODE — max $DEBUG_MAX vaults, verbose"

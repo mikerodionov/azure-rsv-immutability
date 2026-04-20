@@ -103,6 +103,8 @@ AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 ./scripts/rs
 ### Prerequisites
 
 - Azure CLI (`az`) authenticated with access to target subscriptions
+- Azure CLI extension `resource-graph` (the script auto-installs it if missing)
 - `jq` for JSON processing
 - Python 3 (`python3`) — CSV joins and clean/dirty vault reports (RFC-safe parsing)
+- Python pip module (`python3 -m pip`) — needed by Azure CLI to install extensions
 - Bash 4+ (parallel worker bookkeeping uses associative arrays)
