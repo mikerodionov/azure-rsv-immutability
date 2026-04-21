@@ -21,6 +21,7 @@ import (
 
 type Config struct {
 	Debug             bool
+	DebugPaging       bool
 	DebugMax          int
 	Parallel          int
 	SkipRecentHours   int
@@ -507,6 +508,7 @@ func loadConfig() (Config, error) {
 
 	cfg := Config{
 		Debug:             envBool("DEBUG", false),
+		DebugPaging:       envBool("DEBUG_PAGING", false),
 		DebugMax:          envInt("DEBUG_MAX", 3),
 		Parallel:          envInt("PARALLEL", 10),
 		SkipRecentHours:   envInt("SKIP_RECENT_HOURS", 48),
@@ -722,13 +724,14 @@ Resources
 	skip := 0
 	page := 0
 	lastSig := ""
+	debugPaging := envBool("DEBUG_PAGING", false)
 	for {
 		page++
 		body, err := runAzJSON("graph", "query", "-q", query, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
 		if err != nil {
 			return nil, err
 		}
-		rows, total, _, err := extractDataWithTotal(body)
+		rows, total, skipToken, err := extractDataWithTotal(body)
 		if err != nil {
 			return nil, err
 		}
@@ -750,6 +753,24 @@ Resources
 		if page == 1 || page%10 == 0 {
 			log.Printf("[phase1] vault discovery pages=%d accumulated=%d totalHint=%d", page, len(out), total)
 		}
+		if debugPaging {
+			firstSub, firstRG, firstName := "", "", ""
+			lastSub, lastRG, lastName := "", "", ""
+			if len(rows) > 0 {
+				first := rows[0]
+				last := rows[len(rows)-1]
+				firstSub = getAny(first, "subscriptionId", "subscriptionID")
+				firstRG = getAny(first, "resourceGroup", "resourcegroup")
+				firstName = getAny(first, "vaultName", "vaultname", "name")
+				lastSub = getAny(last, "subscriptionId", "subscriptionID")
+				lastRG = getAny(last, "resourceGroup", "resourcegroup")
+				lastName = getAny(last, "vaultName", "vaultname", "name")
+			}
+			log.Printf("[phase1 paging debug] page=%d skip=%d rows=%d new=%d total=%d skipTokenPresent=%t first=%s/%s/%s last=%s/%s/%s",
+				page, skip, len(rows), newInPage, total, strings.TrimSpace(skipToken) != "",
+				firstSub, firstRG, firstName, lastSub, lastRG, lastName,
+			)
+		}
 		if len(rows) == 0 {
 			break
 		}
@@ -766,13 +787,12 @@ Resources
 		}
 		lastSig = curSig
 
-		if len(rows) < pageSize {
-			break
-		}
 		if newInPage == 0 {
 			return nil, fmt.Errorf("vault discovery produced no new vaults at skip=%d; aborting to avoid silent truncation", skip)
 		}
-		skip += pageSize
+		// Advance by actual rows returned since some environments cap returned rows
+		// lower than requested --first.
+		skip += len(rows)
 	}
 	return out, nil
 }
@@ -1160,6 +1180,7 @@ func printBanner() {
 func printConfig(cfg Config) {
 	log.Printf("[*] PARALLEL=%d, DEBUG=%t, SKIP_RECENT_HOURS=%d, RP_AGE_MONTHS=%d", cfg.Parallel, cfg.Debug, cfg.SkipRecentHours, cfg.RPAgeMonths)
 	log.Printf("[*] VAULT_TIMEOUT=%s, AUTO_RETRY=%t (%d/%s)", cfg.VaultTimeout, cfg.AutoRetryTimeouts, cfg.AutoRetryParallel, cfg.AutoRetryTimeout)
+	log.Printf("[*] DEBUG_PAGING=%t", cfg.DebugPaging)
 	log.Printf("[*] REPORT_TIME_MODE=%s", cfg.OutputTimeMode)
 	if cfg.RetryVaultsCSV != "" {
 		log.Printf("[*] RETRY_VAULTS_CSV=%s", cfg.RetryVaultsCSV)
