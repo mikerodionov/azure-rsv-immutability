@@ -633,7 +633,8 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 	noExpiryRows := make([][]string, 0)
 	oldRows := make([][]string, 0)
 	for _, item := range items {
-		rpJSON, err := runAzJSONWithContext(ctx, "backup", "recoverypoint", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--container-name", last(item.Properties.ContainerName), "--item-name", last(item.Name), "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
+		containerName := "IaasVMContainer;" + item.Properties.ContainerName
+		rpJSON, err := runAzJSONWithContext(ctx, "backup", "recoverypoint", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--container-name", containerName, "--item-name", item.Name, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return nil, nil, true
