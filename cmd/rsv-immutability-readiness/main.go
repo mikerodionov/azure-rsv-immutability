@@ -295,19 +295,7 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 
 // Phase 2: query backup items with no assigned policy via Azure Resource Graph.
 func phase2NoPolicy(_ context.Context, runCtx *RunContext) error {
-	q := `
-RecoveryServicesResources
-| where type =~ 'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems'
-| extend vaultName = tostring(split(id, '/')[8])
-| extend policyId = tostring(properties.policyId)
-| extend policyName = tostring(properties.policyInfo.name)
-| extend protectionState = tostring(properties.currentProtectionState)
-| extend friendlyName = tostring(properties.friendlyName)
-| extend itemType = strcat(properties.backupManagementType, '/', properties.workloadType)
-| extend lastBackupTime = tostring(properties.lastBackupTime)
-| where isempty(policyId) and isempty(policyName)
-| project subscriptionId, resourceGroup, vaultName, friendlyName, itemType, protectionState, lastBackupTime
-`
+	q := `RecoveryServicesResources | where type =~ 'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems' | extend vaultName = tostring(split(id, '/')[8]) | extend policyId = tostring(properties.policyId) | extend policyName = tostring(properties.policyInfo.name) | extend protectionState = tostring(properties.currentProtectionState) | extend friendlyName = tostring(properties.friendlyName) | extend itemType = strcat(properties.backupManagementType, '/', properties.workloadType) | extend lastBackupTime = tostring(properties.lastBackupTime) | where isempty(policyId) and isempty(policyName) | project subscriptionId, resourceGroup, vaultName, friendlyName, itemType, protectionState, lastBackupTime`
 	f, err := os.OpenFile(runCtx.CSV["noPolicy"], os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -713,85 +701,38 @@ func loadVaults(retryPath string) ([]VaultInfo, error) {
 		log.Printf("[phase1] loading vault list from RETRY_VAULTS_CSV=%s", retryPath)
 		return readVaultsCSV(retryPath)
 	}
-	query := `
-Resources
-| where type =~ 'microsoft.recoveryservices/vaults'
-| project id
-`
+	query := `Resources | where type =~ 'microsoft.recoveryservices/vaults' | project id`
 	out := make([]VaultInfo, 0)
 	seen := make(map[string]struct{})
-	const pageSize = 1000
-	skip := 0
-	page := 0
-	lastSig := ""
-	debugPaging := envBool("DEBUG_PAGING", false)
-	for {
-		page++
-		body, err := runAzJSON("graph", "query", "-q", query, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
-		if err != nil {
-			return nil, err
-		}
-		rows, total, skipToken, err := extractDataWithTotal(body)
-		if err != nil {
-			return nil, err
-		}
-		newInPage := 0
-		for _, r := range rows {
-			v, ok := vaultInfoFromResourceID(getAny(r, "id", "Id"))
-			if !ok {
-				continue
-			}
-			k := vaultKey(v)
-			if _, ok := seen[k]; ok {
-				continue
-			}
-			seen[k] = struct{}{}
-			out = append(out, v)
-			newInPage++
-		}
-		if page == 1 || page%10 == 0 {
-			log.Printf("[phase1] vault discovery pages=%d accumulated=%d totalHint=%d", page, len(out), total)
-		}
-		if debugPaging {
-			firstSub, firstRG, firstName := "", "", ""
-			lastSub, lastRG, lastName := "", "", ""
-			if len(rows) > 0 {
-				first := rows[0]
-				last := rows[len(rows)-1]
-				if fv, ok := vaultInfoFromResourceID(getAny(first, "id", "Id")); ok {
-					firstSub, firstRG, firstName = fv.Subscription, fv.ResourceGroup, fv.VaultName
-				}
-				if lv, ok := vaultInfoFromResourceID(getAny(last, "id", "Id")); ok {
-					lastSub, lastRG, lastName = lv.Subscription, lv.ResourceGroup, lv.VaultName
-				}
-			}
-			log.Printf("[phase1 paging debug] page=%d skip=%d rows=%d new=%d total=%d skipTokenPresent=%t first=%s/%s/%s last=%s/%s/%s",
-				page, skip, len(rows), newInPage, total, strings.TrimSpace(skipToken) != "",
-				firstSub, firstRG, firstName, lastSub, lastRG, lastName,
-			)
-		}
-		if len(rows) == 0 {
-			break
-		}
-		// Hard guard: if paging repeats the same boundaries, fail fast.
-		curSig := strconv.Itoa(len(rows))
-		if len(rows) > 0 {
-			first := rows[0]
-			last := rows[len(rows)-1]
-			curSig = curSig + "|" + getAny(first, "id", "Id") + "|" + getAny(last, "id", "Id")
-		}
-		if curSig == lastSig {
-			return nil, fmt.Errorf("vault discovery repeated page at skip=%d; aborting to avoid silent truncation", skip)
-		}
-		lastSig = curSig
-
-		if newInPage == 0 {
-			return nil, fmt.Errorf("vault discovery produced no new vaults at skip=%d; aborting to avoid silent truncation", skip)
-		}
-		// Advance by actual rows returned since some environments cap returned rows
-		// lower than requested --first.
-		skip += len(rows)
+	// az graph query --first 1000 auto-pages internally in the CLI
+	// and returns all results in a single call — same as the bash script.
+	body, err := runAzJSON("graph", "query", "-q", query, "--first", "1000")
+	if err != nil {
+		return nil, err
 	}
+	rows, _, _, err := extractDataWithTotal(body)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[phase1] ARG returned %d rows in data array", len(rows))
+	skipped := 0
+	for _, r := range rows {
+		v, ok := vaultInfoFromResourceID(getAny(r, "id", "Id"))
+		if !ok {
+			skipped++
+			continue
+		}
+		k := vaultKey(v)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, v)
+	}
+	if skipped > 0 {
+		log.Printf("[phase1] WARNING: %d rows skipped (could not parse resource ID)", skipped)
+	}
+	log.Printf("[phase1] parsed %d unique vaults from %d rows", len(out), len(rows))
 	return out, nil
 }
 
@@ -1034,7 +975,7 @@ func extractDataWithTotal(raw []byte) ([]map[string]any, int, string, error) {
 			out = append(out, m)
 		}
 	}
-	return out, getInt(payload, "totalRecords"), getAny(payload, "skipToken", "$skipToken"), nil
+	return out, getInt(payload, "totalRecords", "total_records", "count"), getAny(payload, "skipToken", "$skipToken", "skip_token"), nil
 }
 
 func parseTime(value string) (time.Time, error) {
@@ -1105,22 +1046,23 @@ func getAny(m map[string]any, keys ...string) string {
 	return ""
 }
 
-func getInt(m map[string]any, key string) int {
-	v, ok := m[key]
-	if !ok || v == nil {
-		return 0
+func getInt(m map[string]any, keys ...string) int {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case float64:
+			return int(t)
+		case int:
+			return t
+		case string:
+			n, _ := strconv.Atoi(strings.TrimSpace(t))
+			return n
+		}
 	}
-	switch t := v.(type) {
-	case float64:
-		return int(t)
-	case int:
-		return t
-	case string:
-		n, _ := strconv.Atoi(strings.TrimSpace(t))
-		return n
-	default:
-		return 0
-	}
+	return 0
 }
 
 func isResourceNotFoundErr(err error) bool {
