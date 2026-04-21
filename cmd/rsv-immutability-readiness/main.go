@@ -31,6 +31,7 @@ type Config struct {
 	AutoRetryTimeouts bool
 	AutoRetryParallel int
 	AutoRetryTimeout  time.Duration
+	OutputTimeMode    string
 	ReportDir         string
 	TS                string
 }
@@ -275,25 +276,26 @@ RecoveryServicesResources
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
+	const pageSize = 100
 	skip := 0
 	for {
-		out, err := runAzJSON("graph", "query", "-q", q, "--first", "1000", "--skip", strconv.Itoa(skip))
+		out, err := runAzJSON("graph", "query", "-q", q, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
 		if err != nil {
 			return err
 		}
-		rows, err := extractData(out)
+		rows, total, err := extractDataWithTotal(out)
 		if err != nil {
 			return err
 		}
 		for _, row := range rows {
 			record := []string{
-				get(row, "subscriptionId"),
-				get(row, "resourceGroup"),
-				get(row, "vaultName"),
-				get(row, "friendlyName"),
-				get(row, "itemType"),
-				get(row, "protectionState"),
-				get(row, "lastBackupTime"),
+				getAny(row, "subscriptionId", "subscriptionID"),
+				getAny(row, "resourceGroup", "resourcegroup"),
+				getAny(row, "vaultName", "vaultname"),
+				getAny(row, "friendlyName", "friendlyname"),
+				getAny(row, "itemType", "itemtype"),
+				getAny(row, "protectionState", "protectionstate"),
+				normalizeOutputTime(getAny(row, "lastBackupTime", "lastbackuptime"), runCtx.Config.OutputTimeMode),
 			}
 			if strings.Contains(strings.ToLower(record[4]), "azureiaasvm") {
 				runCtx.Stats.NoPolicyVMCount++
@@ -304,10 +306,13 @@ RecoveryServicesResources
 			}
 		}
 		w.Flush()
-		if len(rows) < 1000 {
+		if len(rows) == 0 {
 			break
 		}
-		skip += 1000
+		skip += pageSize
+		if total > 0 && skip >= total {
+			break
+		}
 	}
 	return nil
 }
@@ -473,6 +478,7 @@ func loadConfig() (Config, error) {
 		AutoRetryTimeouts: envBool("AUTO_RETRY_TIMEOUTS", true),
 		AutoRetryParallel: envInt("AUTO_RETRY_PARALLEL", 5),
 		AutoRetryTimeout:  time.Duration(envInt("AUTO_RETRY_TIMEOUT", 1200)) * time.Second,
+		OutputTimeMode:    normalizeOutputTimeMode(os.Getenv("REPORT_TIME_MODE")),
 		ReportDir:         reportDir,
 		TS:                ts,
 	}
@@ -567,12 +573,12 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.VaultTimeout)
 	defer cancel()
 
-	itemsJSON, err := runAzJSON("backup", "item", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
+	itemsJSON, err := runAzJSONWithContext(ctx, "backup", "item", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, nil, true
 		}
-		_ = ctx
+		log.Printf("[phase1] item list failed for vault %s/%s: %v", vault.ResourceGroup, vault.VaultName, err)
 		return nil, nil, false
 	}
 	var items []struct {
@@ -596,11 +602,12 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 	noExpiryRows := make([][]string, 0)
 	oldRows := make([][]string, 0)
 	for _, item := range items {
-		rpJSON, err := runAzJSON("backup", "recoverypoint", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--container-name", last(item.Properties.ContainerName), "--item-name", last(item.Name), "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
+		rpJSON, err := runAzJSONWithContext(ctx, "backup", "recoverypoint", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--container-name", last(item.Properties.ContainerName), "--item-name", last(item.Name), "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return nil, nil, true
 			}
+			log.Printf("[phase1] recoverypoint list failed for vault %s/%s item %s: %v", vault.ResourceGroup, vault.VaultName, item.Name, err)
 			continue
 		}
 
@@ -626,15 +633,30 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 			if t.Before(oldCutoff) {
 				expiry := ""
 				if rp.Properties.RecoveryPointProperties.ExpiryTime != nil {
-					expiry = *rp.Properties.RecoveryPointProperties.ExpiryTime
+					expiry = normalizeOutputTime(*rp.Properties.RecoveryPointProperties.ExpiryTime, cfg.OutputTimeMode)
 				}
-				oldRows = append(oldRows, []string{vault.Subscription, vault.ResourceGroup, vault.VaultName, item.Name, rp.Properties.RecoveryPointTime, rp.Properties.RecoveryPointType, expiry})
+				oldRows = append(oldRows, []string{
+					vault.Subscription,
+					vault.ResourceGroup,
+					vault.VaultName,
+					item.Name,
+					normalizeOutputTime(rp.Properties.RecoveryPointTime, cfg.OutputTimeMode),
+					rp.Properties.RecoveryPointType,
+					expiry,
+				})
 			}
 			if rp.Properties.RecoveryPointProperties.ExpiryTime == nil {
 				if recentCutoff != nil && t.After(*recentCutoff) {
 					continue
 				}
-				noExpiryRows = append(noExpiryRows, []string{vault.Subscription, vault.ResourceGroup, vault.VaultName, item.Name, rp.Properties.RecoveryPointTime, rp.Properties.RecoveryPointType})
+				noExpiryRows = append(noExpiryRows, []string{
+					vault.Subscription,
+					vault.ResourceGroup,
+					vault.VaultName,
+					item.Name,
+					normalizeOutputTime(rp.Properties.RecoveryPointTime, cfg.OutputTimeMode),
+					rp.Properties.RecoveryPointType,
+				})
 			}
 		}
 	}
@@ -651,23 +673,31 @@ Resources
 | project subscriptionId, resourceGroup, vaultName = name
 `
 	out := make([]VaultInfo, 0)
+	const pageSize = 100
 	skip := 0
 	for {
-		body, err := runAzJSON("graph", "query", "-q", q, "--first", "1000", "--skip", strconv.Itoa(skip))
+		body, err := runAzJSON("graph", "query", "-q", q, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
 		if err != nil {
 			return nil, err
 		}
-		rows, err := extractData(body)
+		rows, total, err := extractDataWithTotal(body)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range rows {
-			out = append(out, VaultInfo{Subscription: get(r, "subscriptionId"), ResourceGroup: get(r, "resourceGroup"), VaultName: get(r, "vaultName")})
+			out = append(out, VaultInfo{
+				Subscription:  getAny(r, "subscriptionId", "subscriptionID"),
+				ResourceGroup: getAny(r, "resourceGroup", "resourcegroup"),
+				VaultName:     getAny(r, "vaultName", "vaultname", "name"),
+			})
 		}
-		if len(rows) < 1000 {
+		if len(rows) == 0 {
 			break
 		}
-		skip += 1000
+		skip += pageSize
+		if total > 0 && skip >= total {
+			break
+		}
 	}
 	return out, nil
 }
@@ -874,6 +904,11 @@ func runAzJSON(args ...string) ([]byte, error) {
 	return runCmd(ctx, "az", args...)
 }
 
+func runAzJSONWithContext(ctx context.Context, args ...string) ([]byte, error) {
+	args = append(args, "-o", "json")
+	return runCmd(ctx, "az", args...)
+}
+
 func runCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
@@ -887,13 +922,18 @@ func runCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
 }
 
 func extractData(raw []byte) ([]map[string]any, error) {
+	rows, _, err := extractDataWithTotal(raw)
+	return rows, err
+}
+
+func extractDataWithTotal(raw []byte) ([]map[string]any, int, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	arr, ok := payload["data"].([]any)
 	if !ok {
-		return []map[string]any{}, nil
+		return []map[string]any{}, 0, nil
 	}
 	out := make([]map[string]any, 0, len(arr))
 	for _, item := range arr {
@@ -901,7 +941,7 @@ func extractData(raw []byte) ([]map[string]any, error) {
 			out = append(out, m)
 		}
 	}
-	return out, nil
+	return out, getInt(payload, "totalRecords"), nil
 }
 
 func parseTime(value string) (time.Time, error) {
@@ -917,6 +957,41 @@ func parseTime(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse time")
 }
 
+func normalizeOutputTime(value, mode string) string {
+	if strings.TrimSpace(value) == "" {
+		return value
+	}
+	t, err := parseTime(value)
+	if err != nil {
+		return value
+	}
+	return formatOutputTime(t.UTC(), mode)
+}
+
+func formatOutputTime(t time.Time, mode string) string {
+	switch mode {
+	case "datetime":
+		return t.Format("2006-01-02 15:04:05 UTC")
+	case "date":
+		fallthrough
+	default:
+		return t.Format("2006-01-02")
+	}
+}
+
+func normalizeOutputTimeMode(raw string) string {
+	mode := strings.TrimSpace(strings.ToLower(raw))
+	if mode == "" {
+		return "date"
+	}
+	switch mode {
+	case "date", "datetime":
+		return mode
+	default:
+		return "date"
+	}
+}
+
 func get(m map[string]any, key string) string {
 	v, ok := m[key]
 	if !ok || v == nil {
@@ -926,6 +1001,33 @@ func get(m map[string]any, key string) string {
 		return s
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func getAny(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v := get(m, k); strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func getInt(m map[string]any, key string) int {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(t))
+		return n
+	default:
+		return 0
+	}
 }
 
 func last(s string) string {
@@ -975,6 +1077,7 @@ func printBanner() {
 func printConfig(cfg Config) {
 	log.Printf("[*] PARALLEL=%d, DEBUG=%t, SKIP_RECENT_HOURS=%d, RP_AGE_MONTHS=%d", cfg.Parallel, cfg.Debug, cfg.SkipRecentHours, cfg.RPAgeMonths)
 	log.Printf("[*] VAULT_TIMEOUT=%s, AUTO_RETRY=%t (%d/%s)", cfg.VaultTimeout, cfg.AutoRetryTimeouts, cfg.AutoRetryParallel, cfg.AutoRetryTimeout)
+	log.Printf("[*] REPORT_TIME_MODE=%s", cfg.OutputTimeMode)
 	if cfg.RetryVaultsCSV != "" {
 		log.Printf("[*] RETRY_VAULTS_CSV=%s", cfg.RetryVaultsCSV)
 	}
