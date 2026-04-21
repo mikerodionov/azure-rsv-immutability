@@ -70,62 +70,40 @@ require_python3() {
 }
 
 require_python_pip_module() {
-  local AZ_PY="/usr/bin/python3"
-  local AZ_PY_MISSING_PIP=0
-  local USER_PY_MISSING_PIP=0
-
-  if [[ -x "$AZ_PY" ]]; then
-    "$AZ_PY" -m pip --version >/dev/null 2>&1 || AZ_PY_MISSING_PIP=1
-  else
-    AZ_PY_MISSING_PIP=1
-  fi
-
-  python3 -m pip --version >/dev/null 2>&1 || USER_PY_MISSING_PIP=1
-
-  if [[ "$AZ_PY_MISSING_PIP" -eq 0 && "$USER_PY_MISSING_PIP" -eq 0 ]]; then
+  # Cross-platform: just check if any pip variant works
+  if pip3 --version >/dev/null 2>&1 || pip --version >/dev/null 2>&1 \
+     || python3 -m pip --version >/dev/null 2>&1 || python -m pip --version >/dev/null 2>&1; then
     return 0
   fi
 
-  if [[ "$AZ_PY_MISSING_PIP" -eq 1 ]]; then
-    echo "[!] Azure CLI extension install uses ${AZ_PY}, but pip is missing for that interpreter." >&2
-    echo "[!] Missing requirement: ${AZ_PY} -m pip" >&2
-  elif [[ "$USER_PY_MISSING_PIP" -eq 1 ]]; then
-    echo "[!] python3 is present, but the pip module is missing for your shell interpreter." >&2
-    echo "[!] Missing requirement: python3 -m pip" >&2
-  fi
-  echo "[!] Install pip for your OS, then rerun." >&2
+  echo "[!] pip is required but not found." >&2
+  echo "[!] None of: pip3, pip, python3 -m pip, python -m pip worked." >&2
 
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-}" in
       fedora|rhel|centos|rocky|almalinux)
-        echo "[!] Suggested fix (${ID}): sudo dnf install -y python3-pip" >&2
-        ;;
+        echo "[!] Suggested fix: sudo dnf install -y python3-pip" >&2 ;;
       ubuntu|debian|linuxmint|pop)
-        echo "[!] Suggested fix (${ID}): sudo apt-get update && sudo apt-get install -y python3-pip" >&2
-        ;;
+        echo "[!] Suggested fix: sudo apt-get update && sudo apt-get install -y python3-pip" >&2 ;;
       opensuse*|sles)
-        echo "[!] Suggested fix (${ID}): sudo zypper install -y python3-pip" >&2
-        ;;
+        echo "[!] Suggested fix: sudo zypper install -y python3-pip" >&2 ;;
       alpine)
-        echo "[!] Suggested fix (${ID}): sudo apk add py3-pip" >&2
-        ;;
+        echo "[!] Suggested fix: sudo apk add py3-pip" >&2 ;;
       arch|manjaro)
-        echo "[!] Suggested fix (${ID}): sudo pacman -Sy --noconfirm python-pip" >&2
-        ;;
+        echo "[!] Suggested fix: sudo pacman -Sy --noconfirm python-pip" >&2 ;;
       *)
-        echo "[!] Suggested fix: install package providing 'python3 -m pip' for your distro." >&2
-        ;;
+        echo "[!] Suggested fix: install pip for your distro." >&2 ;;
     esac
   else
     case "$(uname -s 2>/dev/null || echo unknown)" in
       Darwin)
-        echo "[!] Suggested fix (macOS): brew install python" >&2
-        ;;
+        echo "[!] Suggested fix: brew install python" >&2 ;;
+      MINGW*|MSYS*|CYGWIN*)
+        echo "[!] Suggested fix: scoop install python  OR  winget install Python.Python.3" >&2 ;;
       *)
-        echo "[!] Suggested fix: install package providing 'python3 -m pip' for your OS." >&2
-        ;;
+        echo "[!] Suggested fix: install pip for your OS." >&2 ;;
     esac
   fi
 
