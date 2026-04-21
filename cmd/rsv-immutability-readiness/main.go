@@ -713,6 +713,7 @@ Resources
 | project subscriptionId, resourceGroup, vaultName = name
 `
 	out := make([]VaultInfo, 0)
+	seen := make(map[string]struct{})
 	const pageSize = 100
 	skip := 0
 	page := 0
@@ -726,15 +727,29 @@ Resources
 		if err != nil {
 			return nil, err
 		}
+		newInPage := 0
 		for _, r := range rows {
-			out = append(out, VaultInfo{
+			v := VaultInfo{
 				Subscription:  getAny(r, "subscriptionId", "subscriptionID"),
 				ResourceGroup: getAny(r, "resourceGroup", "resourcegroup"),
 				VaultName:     getAny(r, "vaultName", "vaultname", "name"),
-			})
+			}
+			k := vaultKey(v)
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, v)
+			newInPage++
 		}
-		log.Printf("[phase1] vault discovery page=%d rows=%d accumulated=%d totalHint=%d", page, len(rows), len(out), total)
+		log.Printf("[phase1] vault discovery page=%d rows=%d new=%d accumulated=%d totalHint=%d", page, len(rows), newInPage, len(out), total)
 		if len(rows) == 0 {
+			break
+		}
+		// Some Azure CLI/ARG combinations return repeated pages with --skip.
+		// Stop once a page adds no new vaults to avoid infinite loops.
+		if newInPage == 0 {
+			log.Printf("[phase1] vault discovery stabilized (repeated page), stopping pagination")
 			break
 		}
 		skip += pageSize
