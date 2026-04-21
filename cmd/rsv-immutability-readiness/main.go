@@ -617,7 +617,9 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, nil, true
 		}
-		log.Printf("[phase1] item list failed for vault %s/%s: %v", vault.ResourceGroup, vault.VaultName, err)
+		if !isResourceNotFoundErr(err) {
+			log.Printf("[phase1] item list failed for vault %s/%s: %v", vault.ResourceGroup, vault.VaultName, err)
+		}
 		return nil, nil, false
 	}
 	var items []struct {
@@ -646,7 +648,9 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return nil, nil, true
 			}
-			log.Printf("[phase1] recoverypoint list failed for vault %s/%s item %s: %v", vault.ResourceGroup, vault.VaultName, item.Name, err)
+			if !isResourceNotFoundErr(err) {
+				log.Printf("[phase1] recoverypoint list failed for vault %s/%s item %s: %v", vault.ResourceGroup, vault.VaultName, item.Name, err)
+			}
 			continue
 		}
 
@@ -707,19 +711,24 @@ func loadVaults(retryPath string) ([]VaultInfo, error) {
 		log.Printf("[phase1] loading vault list from RETRY_VAULTS_CSV=%s", retryPath)
 		return readVaultsCSV(retryPath)
 	}
-	q := `
+	baseQuery := `
 Resources
 | where type =~ 'microsoft.recoveryservices/vaults'
-| project subscriptionId, resourceGroup, vaultName = name
+| project subscriptionId, resourceGroup, vaultName = name, id
 `
 	out := make([]VaultInfo, 0)
 	seen := make(map[string]struct{})
 	const pageSize = 100
-	skip := 0
+	lastID := ""
 	page := 0
 	for {
 		page++
-		body, err := runAzJSON("graph", "query", "-q", q, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
+		query := baseQuery
+		if lastID != "" {
+			query += "\n| where id > '" + strings.ReplaceAll(lastID, "'", "''") + "'"
+		}
+		query += "\n| order by id asc"
+		body, err := runAzJSON("graph", "query", "-q", query, "--first", strconv.Itoa(pageSize))
 		if err != nil {
 			return nil, err
 		}
@@ -742,18 +751,19 @@ Resources
 			out = append(out, v)
 			newInPage++
 		}
-		log.Printf("[phase1] vault discovery page=%d rows=%d new=%d accumulated=%d totalHint=%d", page, len(rows), newInPage, len(out), total)
+		if page == 1 || page%10 == 0 {
+			log.Printf("[phase1] vault discovery pages=%d accumulated=%d totalHint=%d", page, len(out), total)
+		}
 		if len(rows) == 0 {
 			break
 		}
-		// Some Azure CLI/ARG combinations return repeated pages with --skip.
-		// Stop once a page adds no new vaults to avoid infinite loops.
-		if newInPage == 0 {
-			log.Printf("[phase1] vault discovery stabilized (repeated page), stopping pagination")
+		lastRow := rows[len(rows)-1]
+		nextID := getAny(lastRow, "id", "Id")
+		if strings.TrimSpace(nextID) == "" || nextID == lastID {
 			break
 		}
-		skip += pageSize
-		if total > 0 && skip >= total {
+		lastID = nextID
+		if len(rows) < pageSize {
 			break
 		}
 	}
@@ -1086,6 +1096,14 @@ func getInt(m map[string]any, key string) int {
 	default:
 		return 0
 	}
+}
+
+func isResourceNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "resourcenotfound") || strings.Contains(msg, "resource not found")
 }
 
 func last(s string) string {
