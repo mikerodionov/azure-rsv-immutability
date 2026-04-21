@@ -716,7 +716,7 @@ func loadVaults(retryPath string) ([]VaultInfo, error) {
 	query := `
 Resources
 | where type =~ 'microsoft.recoveryservices/vaults'
-| project subscriptionId, resourceGroup, vaultName = name
+| project id
 `
 	out := make([]VaultInfo, 0)
 	seen := make(map[string]struct{})
@@ -737,10 +737,9 @@ Resources
 		}
 		newInPage := 0
 		for _, r := range rows {
-			v := VaultInfo{
-				Subscription:  getAny(r, "subscriptionId", "subscriptionID"),
-				ResourceGroup: getAny(r, "resourceGroup", "resourcegroup"),
-				VaultName:     getAny(r, "vaultName", "vaultname", "name"),
+			v, ok := vaultInfoFromResourceID(getAny(r, "id", "Id"))
+			if !ok {
+				continue
 			}
 			k := vaultKey(v)
 			if _, ok := seen[k]; ok {
@@ -759,12 +758,12 @@ Resources
 			if len(rows) > 0 {
 				first := rows[0]
 				last := rows[len(rows)-1]
-				firstSub = getAny(first, "subscriptionId", "subscriptionID")
-				firstRG = getAny(first, "resourceGroup", "resourcegroup")
-				firstName = getAny(first, "vaultName", "vaultname", "name")
-				lastSub = getAny(last, "subscriptionId", "subscriptionID")
-				lastRG = getAny(last, "resourceGroup", "resourcegroup")
-				lastName = getAny(last, "vaultName", "vaultname", "name")
+				if fv, ok := vaultInfoFromResourceID(getAny(first, "id", "Id")); ok {
+					firstSub, firstRG, firstName = fv.Subscription, fv.ResourceGroup, fv.VaultName
+				}
+				if lv, ok := vaultInfoFromResourceID(getAny(last, "id", "Id")); ok {
+					lastSub, lastRG, lastName = lv.Subscription, lv.ResourceGroup, lv.VaultName
+				}
 			}
 			log.Printf("[phase1 paging debug] page=%d skip=%d rows=%d new=%d total=%d skipTokenPresent=%t first=%s/%s/%s last=%s/%s/%s",
 				page, skip, len(rows), newInPage, total, strings.TrimSpace(skipToken) != "",
@@ -779,8 +778,7 @@ Resources
 		if len(rows) > 0 {
 			first := rows[0]
 			last := rows[len(rows)-1]
-			curSig = curSig + "|" + getAny(first, "subscriptionId", "subscriptionID") + "|" + getAny(first, "resourceGroup", "resourcegroup") + "|" + getAny(first, "vaultName", "vaultname", "name") +
-				"|" + getAny(last, "subscriptionId", "subscriptionID") + "|" + getAny(last, "resourceGroup", "resourcegroup") + "|" + getAny(last, "vaultName", "vaultname", "name")
+			curSig = curSig + "|" + getAny(first, "id", "Id") + "|" + getAny(last, "id", "Id")
 		}
 		if curSig == lastSig {
 			return nil, fmt.Errorf("vault discovery repeated page at skip=%d; aborting to avoid silent truncation", skip)
@@ -1147,6 +1145,31 @@ func vmKey(item string) string {
 
 func vaultKey(v VaultInfo) string {
 	return strings.ToLower(v.Subscription + "|" + v.ResourceGroup + "|" + v.VaultName)
+}
+
+func vaultInfoFromResourceID(id string) (VaultInfo, bool) {
+	raw := strings.TrimSpace(id)
+	if raw == "" {
+		return VaultInfo{}, false
+	}
+	parts := strings.Split(raw, "/")
+	// Expected:
+	// /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.RecoveryServices/vaults/{name}
+	if len(parts) < 9 {
+		return VaultInfo{}, false
+	}
+	if strings.ToLower(parts[1]) != "subscriptions" || strings.ToLower(parts[3]) != "resourcegroups" {
+		return VaultInfo{}, false
+	}
+	v := VaultInfo{
+		Subscription:  parts[2],
+		ResourceGroup: parts[4],
+		VaultName:     parts[len(parts)-1],
+	}
+	if v.Subscription == "" || v.ResourceGroup == "" || v.VaultName == "" {
+		return VaultInfo{}, false
+	}
+	return v, true
 }
 
 func splitKey(k string) (string, string, string) {
