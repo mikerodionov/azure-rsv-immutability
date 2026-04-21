@@ -2,7 +2,7 @@
 
 ## RSV Immutability Readiness Check Script
 
-Scans all Recovery Services Vaults across subscriptions and produces up to 9 CSV reports + a summary table to assess readiness for vault-level immutability locking.
+Scans all Recovery Services Vaults across subscriptions and produces CSV reports, a clean vault list, and a summary table to assess readiness for vault-level immutability locking.
 
 ### Repository Structure
 
@@ -31,6 +31,8 @@ All CSVs are written on-the-fly so partial data survives crashes. Reports 1-2 ar
 - `7-timed-out-vaults-*.csv` — Vault workers killed after `VAULT_TIMEOUT`; treated as `dirty` with reason `timeout`
 - `8-final-clean-vaults-*.csv` — Final authoritative clean list after timeout retry reconciliation
 - `9-final-dirty-vaults-*.csv` — Final authoritative dirty list after timeout retry reconciliation
+- `10-dirty-items-detail-*.csv` — Item-level detail for every dirty vault: offending items/RPs with reason, RP time, type, and expiry (for review)
+- `clean-vaults-*.list` — Plain text list of clean vault names (one per line, no header) for use as input to bulk operations (e.g. immutability-management workflow whitelist)
 
 ### Clean vs dirty vaults
 
@@ -96,7 +98,8 @@ The repository now also contains a Go CLI skeleton at `cmd/rsv-immutability-read
 Current status:
 - full 4-phase implementation with Azure CLI calls
 - parallel per-vault processing with timeout handling
-- same 9 CSV contracts and final reconciliation logic (including auto retry)
+- same CSV contracts and final reconciliation logic (including auto retry)
+- retry writes to temp dir (cleaned up automatically) — only one set of output files per run
 
 Run it:
 
@@ -117,6 +120,7 @@ go run ./cmd/rsv-immutability-readiness
 - `AUTO_RETRY_TIMEOUT` (default `1200`) — Per-vault timeout seconds for auto retry pass
 - `DEBUG` (default `0`) — Enable verbose debug logging (`1` to enable)
 - `DEBUG_MAX` (default `3`) — Max vaults to process in debug mode
+- `REPORT_DIR` (default `../rsv-reports/`) — Directory for output files
 
 ### Prerequisites
 

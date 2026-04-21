@@ -115,6 +115,7 @@ func runFull() error {
 		retryCfg.VaultTimeout = runCtx.Config.AutoRetryTimeout
 		retryCfg.AutoRetryTimeouts = false
 		retryCfg.RetryVaultsCSV = "__in_memory_retry__"
+		retryCfg.CSVOutput = false // write retry CSVs to temp dir, not report dir
 		retryCfg.TS = time.Now().UTC().Format("20060102-150405")
 		retryCtx, err = initRunContext(retryCfg)
 		if err != nil {
@@ -140,6 +141,9 @@ func runFull() error {
 		if err := reconcileFinal(runCtx, retryCtx); err != nil {
 			return err
 		}
+	}
+	if retryCtx != nil && retryCtx.Config.ReportDir != runCtx.Config.ReportDir {
+		_ = os.RemoveAll(retryCtx.Config.ReportDir)
 	}
 	printSummary(runCtx, time.Since(start))
 	return nil
@@ -540,31 +544,40 @@ func initRunContext(cfg Config) (*RunContext, error) {
 	}
 
 	csvPaths := map[string]string{
-		"noExpiry":   filepath.Join(baseDir, fmt.Sprintf("1-no-expiry-rps-%s.csv", cfg.TS)),
-		"noPolicy":   filepath.Join(baseDir, fmt.Sprintf("2-no-policy-items-%s.csv", cfg.TS)),
-		"overlap":    filepath.Join(baseDir, fmt.Sprintf("3-no-expiry-no-policy-%s.csv", cfg.TS)),
-		"oldRPs":     filepath.Join(baseDir, fmt.Sprintf("4-old-rps-%s.csv", cfg.TS)),
-		"clean":      filepath.Join(baseDir, fmt.Sprintf("5-clean-vaults-%s.csv", cfg.TS)),
-		"dirty":      filepath.Join(baseDir, fmt.Sprintf("6-dirty-vaults-%s.csv", cfg.TS)),
-		"timeouts":   filepath.Join(baseDir, fmt.Sprintf("7-timed-out-vaults-%s.csv", cfg.TS)),
-		"finalClean": filepath.Join(baseDir, fmt.Sprintf("8-final-clean-vaults-%s.csv", cfg.TS)),
-		"finalDirty": filepath.Join(baseDir, fmt.Sprintf("9-final-dirty-vaults-%s.csv", cfg.TS)),
+		"noExpiry":    filepath.Join(baseDir, fmt.Sprintf("1-no-expiry-rps-%s.csv", cfg.TS)),
+		"noPolicy":    filepath.Join(baseDir, fmt.Sprintf("2-no-policy-items-%s.csv", cfg.TS)),
+		"overlap":     filepath.Join(baseDir, fmt.Sprintf("3-no-expiry-no-policy-%s.csv", cfg.TS)),
+		"oldRPs":      filepath.Join(baseDir, fmt.Sprintf("4-old-rps-%s.csv", cfg.TS)),
+		"clean":       filepath.Join(baseDir, fmt.Sprintf("5-clean-vaults-%s.csv", cfg.TS)),
+		"dirty":       filepath.Join(baseDir, fmt.Sprintf("6-dirty-vaults-%s.csv", cfg.TS)),
+		"timeouts":    filepath.Join(baseDir, fmt.Sprintf("7-timed-out-vaults-%s.csv", cfg.TS)),
+		"finalClean":  filepath.Join(baseDir, fmt.Sprintf("8-final-clean-vaults-%s.csv", cfg.TS)),
+		"finalDirty":  filepath.Join(baseDir, fmt.Sprintf("9-final-dirty-vaults-%s.csv", cfg.TS)),
+		"dirtyDetail": filepath.Join(baseDir, fmt.Sprintf("10-dirty-items-detail-%s.csv", cfg.TS)),
+		"cleanList":   filepath.Join(baseDir, fmt.Sprintf("clean-vaults-%s.list", cfg.TS)),
 	}
 
 	headers := map[string]string{
-		"noExpiry":   "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType",
-		"noPolicy":   "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime",
-		"overlap":    "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp",
-		"oldRPs":     "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,expiryTime",
-		"clean":      "subscription,resourceGroup,vaultName",
-		"dirty":      "subscription,resourceGroup,vaultName,reason",
-		"timeouts":   "subscription,resourceGroup,vaultName,elapsedSeconds,pid",
-		"finalClean": "subscription,resourceGroup,vaultName",
-		"finalDirty": "subscription,resourceGroup,vaultName,reason",
+		"noExpiry":    "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType",
+		"noPolicy":    "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime",
+		"overlap":     "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp",
+		"oldRPs":      "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,expiryTime",
+		"clean":       "subscription,resourceGroup,vaultName",
+		"dirty":       "subscription,resourceGroup,vaultName,reason",
+		"timeouts":    "subscription,resourceGroup,vaultName,elapsedSeconds,pid",
+		"finalClean":  "subscription,resourceGroup,vaultName",
+		"finalDirty":  "subscription,resourceGroup,vaultName,reason",
+		"dirtyDetail": "subscription,resourceGroup,vaultName,reason,itemName,recoveryPointTime,recoveryPointType,expiryTime",
 	}
 	for key, path := range csvPaths {
-		if err := os.WriteFile(path, []byte(headers[key]+"\n"), 0o644); err != nil {
-			return nil, err
+		if h, ok := headers[key]; ok {
+			if err := os.WriteFile(path, []byte(h+"\n"), 0o644); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -819,6 +832,118 @@ func writeFinal(base *RunContext, dirty map[string]string) error {
 			continue
 		}
 		if err := cw.Write([]string{v.Subscription, v.ResourceGroup, v.VaultName}); err != nil {
+			return err
+		}
+	}
+
+	if base.Config.CSVOutput {
+		if err := writeDirtyDetail(base, dirty); err != nil {
+			return err
+		}
+		if err := writeCleanList(base, dirty); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeDirtyDetail(base *RunContext, dirty map[string]string) error {
+	// Build set of dirty vault keys for quick lookup
+	dirtyVaults := map[string]string{}
+	for k, r := range dirty {
+		_, _, v := splitKey(k)
+		dirtyVaults[k] = r
+		_ = v
+	}
+
+	// Collect items from no-expiry RPs (file 1)
+	type detailRow struct {
+		sub, rg, vault, reason, item, rpTime, rpType, expiry string
+	}
+	var rows []detailRow
+
+	addFromCSV := func(path, reason string, itemCol, rpTimeCol, rpTypeCol, expiryCol int) error {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		r := csv.NewReader(f)
+		if _, err := r.Read(); err != nil {
+			return nil // empty file
+		}
+		for {
+			rec, err := r.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if len(rec) < 3 {
+				continue
+			}
+			k := strings.ToLower(rec[0] + "|" + rec[1] + "|" + rec[2])
+			if _, ok := dirtyVaults[k]; !ok {
+				continue
+			}
+			item, rpTime, rpType, expiry := "", "", "", ""
+			if itemCol >= 0 && itemCol < len(rec) {
+				item = rec[itemCol]
+			}
+			if rpTimeCol >= 0 && rpTimeCol < len(rec) {
+				rpTime = rec[rpTimeCol]
+			}
+			if rpTypeCol >= 0 && rpTypeCol < len(rec) {
+				rpType = rec[rpTypeCol]
+			}
+			if expiryCol >= 0 && expiryCol < len(rec) {
+				expiry = rec[expiryCol]
+			}
+			rows = append(rows, detailRow{rec[0], rec[1], rec[2], reason, item, rpTime, rpType, expiry})
+		}
+		return nil
+	}
+
+	// file 3: no-expiry + no-policy overlap (friendlyName=col3)
+	if err := addFromCSV(base.CSV["overlap"], "no-policy-no-expiry", 3, -1, -1, -1); err != nil {
+		return err
+	}
+	// file 1: no-expiry RPs (itemName=col3, rpTime=col4, rpType=col5)
+	if err := addFromCSV(base.CSV["noExpiry"], "no-expiry-rp", 3, 4, 5, -1); err != nil {
+		return err
+	}
+	// file 4: old RPs (itemName=col3, rpTime=col4, rpType=col5, expiry=col6)
+	if err := addFromCSV(base.CSV["oldRPs"], "old-rp", 3, 4, 5, 6); err != nil {
+		return err
+	}
+
+	df, err := os.OpenFile(base.CSV["dirtyDetail"], os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	w := csv.NewWriter(df)
+	defer w.Flush()
+	for _, r := range rows {
+		if err := w.Write([]string{r.sub, r.rg, r.vault, r.reason, r.item, r.rpTime, r.rpType, r.expiry}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeCleanList(base *RunContext, dirty map[string]string) error {
+	f, err := os.OpenFile(base.CSV["cleanList"], os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, v := range base.AllVaults {
+		if _, ok := dirty[vaultKey(v)]; ok {
+			continue
+		}
+		if _, err := fmt.Fprintln(f, v.VaultName); err != nil {
 			return err
 		}
 	}
@@ -1170,6 +1295,10 @@ func printSummary(runCtx *RunContext, elapsed time.Duration) {
 	if runCtx.Config.RetryVaultsCSV == "" {
 		fmt.Printf("  %-40s %d\n", "Final clean vaults:", runCtx.Stats.FinalCleanCount)
 		fmt.Printf("  %-40s %d\n", "Final dirty vaults:", runCtx.Stats.FinalDirtyCount)
+		if total := runCtx.Stats.FinalCleanCount + runCtx.Stats.FinalDirtyCount; total != int64(runCtx.Stats.VaultCount) {
+			fmt.Printf("  ⚠ MISMATCH: final clean (%d) + dirty (%d) = %d, expected %d\n",
+				runCtx.Stats.FinalCleanCount, runCtx.Stats.FinalDirtyCount, total, runCtx.Stats.VaultCount)
+		}
 	}
 	fmt.Printf("  %-40s %s\n", "Total execution time:", formatDuration(elapsed))
 	fmt.Println("=============================================")
