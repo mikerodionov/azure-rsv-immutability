@@ -714,24 +714,21 @@ func loadVaults(retryPath string) ([]VaultInfo, error) {
 	query := `
 Resources
 | where type =~ 'microsoft.recoveryservices/vaults'
-| project subscriptionId, resourceGroup, vaultName = name, id
+| project subscriptionId, resourceGroup, vaultName = name
 `
 	out := make([]VaultInfo, 0)
 	seen := make(map[string]struct{})
-	const pageSize = 100
-	skipToken := ""
+	const pageSize = 1000
+	skip := 0
 	page := 0
+	lastSig := ""
 	for {
 		page++
-		args := []string{"graph", "query", "-q", query, "--first", strconv.Itoa(pageSize)}
-		if skipToken != "" {
-			args = append(args, "--skip-token", skipToken)
-		}
-		body, err := runAzJSON(args...)
+		body, err := runAzJSON("graph", "query", "-q", query, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
 		if err != nil {
 			return nil, err
 		}
-		rows, total, nextSkipToken, err := extractDataWithTotal(body)
+		rows, total, _, err := extractDataWithTotal(body)
 		if err != nil {
 			return nil, err
 		}
@@ -756,16 +753,26 @@ Resources
 		if len(rows) == 0 {
 			break
 		}
+		// Hard guard: if paging repeats the same boundaries, fail fast.
+		curSig := strconv.Itoa(len(rows))
+		if len(rows) > 0 {
+			first := rows[0]
+			last := rows[len(rows)-1]
+			curSig = curSig + "|" + getAny(first, "subscriptionId", "subscriptionID") + "|" + getAny(first, "resourceGroup", "resourcegroup") + "|" + getAny(first, "vaultName", "vaultname", "name") +
+				"|" + getAny(last, "subscriptionId", "subscriptionID") + "|" + getAny(last, "resourceGroup", "resourcegroup") + "|" + getAny(last, "vaultName", "vaultname", "name")
+		}
+		if curSig == lastSig {
+			return nil, fmt.Errorf("vault discovery repeated page at skip=%d; aborting to avoid silent truncation", skip)
+		}
+		lastSig = curSig
+
 		if len(rows) < pageSize {
 			break
 		}
-		if strings.TrimSpace(nextSkipToken) == "" {
-			break
+		if newInPage == 0 {
+			return nil, fmt.Errorf("vault discovery produced no new vaults at skip=%d; aborting to avoid silent truncation", skip)
 		}
-		if nextSkipToken == skipToken {
-			break
-		}
-		skipToken = nextSkipToken
+		skip += pageSize
 	}
 	return out, nil
 }
