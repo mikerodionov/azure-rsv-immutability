@@ -1,1 +1,3 @@
 # Reports are generated outside the repository in ../rsv-reports/
+rsv-immutability-readiness
+*.exe
