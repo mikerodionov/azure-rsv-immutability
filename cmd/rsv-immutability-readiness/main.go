@@ -322,7 +322,7 @@ RecoveryServicesResources
 		if err != nil {
 			return err
 		}
-		rows, total, err := extractDataWithTotal(out)
+		rows, total, _, err := extractDataWithTotal(out)
 		if err != nil {
 			return err
 		}
@@ -711,7 +711,7 @@ func loadVaults(retryPath string) ([]VaultInfo, error) {
 		log.Printf("[phase1] loading vault list from RETRY_VAULTS_CSV=%s", retryPath)
 		return readVaultsCSV(retryPath)
 	}
-	baseQuery := `
+	query := `
 Resources
 | where type =~ 'microsoft.recoveryservices/vaults'
 | project subscriptionId, resourceGroup, vaultName = name, id
@@ -719,20 +719,19 @@ Resources
 	out := make([]VaultInfo, 0)
 	seen := make(map[string]struct{})
 	const pageSize = 100
-	lastID := ""
+	skipToken := ""
 	page := 0
 	for {
 		page++
-		query := baseQuery
-		if lastID != "" {
-			query += "\n| where id > '" + strings.ReplaceAll(lastID, "'", "''") + "'"
+		args := []string{"graph", "query", "-q", query, "--first", strconv.Itoa(pageSize)}
+		if skipToken != "" {
+			args = append(args, "--skip-token", skipToken)
 		}
-		query += "\n| order by id asc"
-		body, err := runAzJSON("graph", "query", "-q", query, "--first", strconv.Itoa(pageSize))
+		body, err := runAzJSON(args...)
 		if err != nil {
 			return nil, err
 		}
-		rows, total, err := extractDataWithTotal(body)
+		rows, total, nextSkipToken, err := extractDataWithTotal(body)
 		if err != nil {
 			return nil, err
 		}
@@ -757,15 +756,16 @@ Resources
 		if len(rows) == 0 {
 			break
 		}
-		lastRow := rows[len(rows)-1]
-		nextID := getAny(lastRow, "id", "Id")
-		if strings.TrimSpace(nextID) == "" || nextID == lastID {
-			break
-		}
-		lastID = nextID
 		if len(rows) < pageSize {
 			break
 		}
+		if strings.TrimSpace(nextSkipToken) == "" {
+			break
+		}
+		if nextSkipToken == skipToken {
+			break
+		}
+		skipToken = nextSkipToken
 	}
 	return out, nil
 }
@@ -990,18 +990,18 @@ func runCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
 }
 
 func extractData(raw []byte) ([]map[string]any, error) {
-	rows, _, err := extractDataWithTotal(raw)
+	rows, _, _, err := extractDataWithTotal(raw)
 	return rows, err
 }
 
-func extractDataWithTotal(raw []byte) ([]map[string]any, int, error) {
+func extractDataWithTotal(raw []byte) ([]map[string]any, int, string, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	arr, ok := payload["data"].([]any)
 	if !ok {
-		return []map[string]any{}, 0, nil
+		return []map[string]any{}, 0, "", nil
 	}
 	out := make([]map[string]any, 0, len(arr))
 	for _, item := range arr {
@@ -1009,7 +1009,7 @@ func extractDataWithTotal(raw []byte) ([]map[string]any, int, error) {
 			out = append(out, m)
 		}
 	}
-	return out, getInt(payload, "totalRecords"), nil
+	return out, getInt(payload, "totalRecords"), getAny(payload, "skipToken", "$skipToken"), nil
 }
 
 func parseTime(value string) (time.Time, error) {
