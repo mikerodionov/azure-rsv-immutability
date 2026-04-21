@@ -200,16 +200,43 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 	var oldMu sync.Mutex
 	var timeoutMu sync.Mutex
 	var timedOutMu sync.Mutex
+	var started int64
+	var completed int64
 
 	workers := runCtx.Config.Parallel
 	if workers < 1 {
 		workers = 1
 	}
+	log.Printf("[*] phase1 vault workers=%d total_vaults=%d", workers, len(runCtx.AllVaults))
+
+	doneProgress := make(chan struct{})
+	go func(total int) {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s := atomic.LoadInt64(&started)
+				c := atomic.LoadInt64(&completed)
+				active := s - c
+				log.Printf("[phase1 progress] completed=%d/%d active=%d no-expiry=%d old-rps=%d timeouts=%d",
+					c, total, active,
+					atomic.LoadInt64(&runCtx.Stats.NoExpiryCount),
+					atomic.LoadInt64(&runCtx.Stats.OldRPCount),
+					atomic.LoadInt64(&runCtx.Stats.TimeoutCount),
+				)
+			case <-doneProgress:
+				return
+			}
+		}
+	}(len(runCtx.AllVaults))
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for v := range jobs {
+				atomic.AddInt64(&started, 1)
 				start := time.Now()
 				noExpRows, oldRows, timedOut := processVault(runCtx.Config, v)
 				if timedOut {
@@ -221,6 +248,7 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 					runCtx.TimedOut[vaultKey(v)] = v
 					timedOutMu.Unlock()
 					atomic.AddInt64(&runCtx.Stats.TimeoutCount, 1)
+					atomic.AddInt64(&completed, 1)
 					continue
 				}
 				if len(noExpRows) > 0 {
@@ -241,6 +269,7 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 					oldMu.Unlock()
 					atomic.AddInt64(&runCtx.Stats.OldRPCount, int64(len(oldRows)))
 				}
+				atomic.AddInt64(&completed, 1)
 			}
 		}()
 	}
@@ -250,6 +279,14 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 	}
 	close(jobs)
 	wg.Wait()
+	close(doneProgress)
+	log.Printf("[*] phase1 complete: completed=%d/%d no-expiry=%d old-rps=%d timeouts=%d",
+		atomic.LoadInt64(&completed),
+		int64(len(runCtx.AllVaults)),
+		atomic.LoadInt64(&runCtx.Stats.NoExpiryCount),
+		atomic.LoadInt64(&runCtx.Stats.OldRPCount),
+		atomic.LoadInt64(&runCtx.Stats.TimeoutCount),
+	)
 	return nil
 }
 
