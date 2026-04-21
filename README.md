@@ -7,8 +7,11 @@ Scans all Recovery Services Vaults across subscriptions and produces up to 9 CSV
 ### Repository Structure
 
 ```text
+├── cmd/
+│   └── rsv-immutability-readiness/             # Go port (work in progress)
 ├── scripts/
 │   └── rsv-immutability-readiness-check.sh   # main script
+├── go.mod
 ├── .gitignore
 └── README.md
 ```
@@ -84,6 +87,21 @@ AUTO_RETRY_TIMEOUTS=1 ./scripts/rsv-immutability-readiness-check.sh
 
 # tune automatic retry settings
 AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 ./scripts/rsv-immutability-readiness-check.sh
+```
+
+### Go Port (iterative)
+
+The repository now also contains a Go CLI skeleton at `cmd/rsv-immutability-readiness/main.go`.
+
+Current status:
+- full 4-phase implementation with Azure CLI calls
+- parallel per-vault processing with timeout handling
+- same 9 CSV contracts and final reconciliation logic (including auto retry)
+
+Run it:
+
+```bash
+go run ./cmd/rsv-immutability-readiness
 ```
 
 ### Environment Variables
