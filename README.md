@@ -8,9 +8,9 @@ Scans all Recovery Services Vaults across subscriptions and produces up to 9 CSV
 
 ```text
 ├── cmd/
-│   └── rsv-immutability-readiness/             # Go port (work in progress)
+│   └── rsv-immutability-readiness/         # Go port
 ├── scripts/
-│   └── rsv-immutability-readiness-check.sh   # main script
+│   └── rsv-immutability-readiness-check.sh # main script
 ├── go.mod
 ├── .gitignore
 └── README.md
