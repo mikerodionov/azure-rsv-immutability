@@ -158,10 +158,12 @@ func runPhase(ctx context.Context, title string, fn func(context.Context, *RunCo
 func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 	var err error
 	if len(runCtx.AllVaults) == 0 {
+		log.Printf("[phase1] discovering vaults via ARG...")
 		runCtx.AllVaults, err = loadVaults(runCtx.Config.RetryVaultsCSV)
 		if err != nil {
 			return err
 		}
+		log.Printf("[phase1] discovered %d vault(s)", len(runCtx.AllVaults))
 	}
 	if runCtx.Config.Debug && len(runCtx.AllVaults) > runCtx.Config.DebugMax {
 		runCtx.AllVaults = runCtx.AllVaults[:runCtx.Config.DebugMax]
@@ -702,6 +704,7 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 
 func loadVaults(retryPath string) ([]VaultInfo, error) {
 	if strings.TrimSpace(retryPath) != "" {
+		log.Printf("[phase1] loading vault list from RETRY_VAULTS_CSV=%s", retryPath)
 		return readVaultsCSV(retryPath)
 	}
 	q := `
@@ -712,7 +715,9 @@ Resources
 	out := make([]VaultInfo, 0)
 	const pageSize = 100
 	skip := 0
+	page := 0
 	for {
+		page++
 		body, err := runAzJSON("graph", "query", "-q", q, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
 		if err != nil {
 			return nil, err
@@ -728,6 +733,7 @@ Resources
 				VaultName:     getAny(r, "vaultName", "vaultname", "name"),
 			})
 		}
+		log.Printf("[phase1] vault discovery page=%d rows=%d accumulated=%d totalHint=%d", page, len(rows), len(out), total)
 		if len(rows) == 0 {
 			break
 		}
