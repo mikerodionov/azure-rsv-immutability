@@ -32,6 +32,11 @@ All CSVs are written on-the-fly so partial data survives crashes. Reports 1-2 ar
 - `8-final-clean-vaults-*.csv` — Final authoritative clean list after timeout retry reconciliation
 - `9-final-dirty-vaults-*.csv` — Final authoritative dirty list after timeout retry reconciliation
 - `10-dirty-items-detail-*.csv` — Item-level detail for every dirty vault: offending items/RPs with reason, RP time, type, and expiry (for review)
+- `11-no-policy-protectionstate-distribution-*.csv` — `protectionState` distribution for all no-policy items
+- `12-overlap-protectionstate-distribution-*.csv` — `protectionState` distribution for overlap subset (no-policy + no-expiry)
+- `13-inferred-expiry-passed-*.csv` — Null-expiry RPs where inferred expiry is already elapsed (includes `protectionState`, `inferenceBase`, `retentionDays`)
+- `14-inferred-expiry-not-passed-*.csv` — Null-expiry RPs where inferred expiry has not elapsed yet (includes `protectionState`, `inferenceBase`, `retentionDays`)
+- `15-deferred-delete-items-*.csv` — Backup items scheduled for deferred delete / soft-delete lifecycle (excluded from RP enumeration and inferred-risk reports)
 - `clean-vaults-*.list` — Plain text list of clean vault names (one per line, no header) for use as input to bulk operations (e.g. immutability-management workflow whitelist)
 
 ### Clean vs dirty vaults
@@ -96,10 +101,12 @@ AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 ./scripts/rs
 The repository now also contains a Go CLI skeleton at `cmd/rsv-immutability-readiness/main.go`.
 
 Current status:
+
 - full 4-phase implementation with Azure CLI calls
 - parallel per-vault processing with timeout handling
 - same CSV contracts and final reconciliation logic (including auto retry)
 - retry writes to temp dir (cleaned up automatically) — only one set of output files per run
+- added inferred-expiry analysis for null-expiry RPs with explicit inference source (`RSV_Assigned_Policy` / `Assumed_Max_Retention`)
 
 Run it:
 
@@ -120,7 +127,19 @@ go run ./cmd/rsv-immutability-readiness
 - `AUTO_RETRY_TIMEOUT` (default `1200`) — Per-vault timeout seconds for auto retry pass
 - `DEBUG` (default `0`) — Enable verbose debug logging (`1` to enable)
 - `DEBUG_MAX` (default `3`) — Max vaults to process in debug mode
+- `DEBUG_PAGING` (default `0`) — Enable vault-discovery paging diagnostics in logs
 - `REPORT_DIR` (default `../rsv-reports/`) — Directory for output files
+- `REPORT_TIME_MODE` (default `date`) — Output timestamp format in CSVs: `date` (`YYYY-MM-DD`) or `datetime` (`YYYY-MM-DD HH:MM:SS UTC`)
+- `ASSUMED_MAX_RETENTION_DAYS` (default `3650`) — Fallback retention used for inferred-expiry reports when assigned policy retention cannot be resolved (`3650` = 10 years, chosen as conservative upper-bound assumption)
+- `INFERRED_EXCLUDE_STATES` (default `SoftDeleted`) — Comma-separated backup item protection states to exclude from inferred-expiry reports (example: `SoftDeleted,BackupStopped`)
+
+### Deferred-delete optimization
+
+Items with `isScheduledForDeferredDelete=true` are treated as soft-delete lifecycle artifacts:
+
+- skipped from phase 1 RP enumeration for speed,
+- excluded from inferred expiry reports (`13` / `14`),
+- captured in report `15-deferred-delete-items-*.csv` for manual verification/audit.
 
 ### Prerequisites
 

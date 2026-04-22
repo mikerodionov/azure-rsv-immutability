@@ -20,21 +20,23 @@ import (
 )
 
 type Config struct {
-	Debug             bool
-	DebugPaging       bool
-	DebugMax          int
-	Parallel          int
-	SkipRecentHours   int
-	RPAgeMonths       int
-	CSVOutput         bool
-	VaultTimeout      time.Duration
-	RetryVaultsCSV    string
-	AutoRetryTimeouts bool
-	AutoRetryParallel int
-	AutoRetryTimeout  time.Duration
-	OutputTimeMode    string
-	ReportDir         string
-	TS                string
+	Debug                   bool
+	DebugPaging             bool
+	DebugMax                int
+	Parallel                int
+	SkipRecentHours         int
+	RPAgeMonths             int
+	CSVOutput               bool
+	VaultTimeout            time.Duration
+	RetryVaultsCSV          string
+	AutoRetryTimeouts       bool
+	AutoRetryParallel       int
+	AutoRetryTimeout        time.Duration
+	AssumedMaxRetentionDays int
+	InferredExcludeStates   map[string]struct{}
+	OutputTimeMode          string
+	ReportDir               string
+	TS                      string
 }
 
 type VaultInfo struct {
@@ -188,6 +190,21 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 		return err
 	}
 	defer oldHandle.Close()
+	inferredPassedHandle, err := os.OpenFile(runCtx.CSV["inferredExpiryPassed"], os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer inferredPassedHandle.Close()
+	inferredNotPassedHandle, err := os.OpenFile(runCtx.CSV["inferredExpiryNotPassed"], os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer inferredNotPassedHandle.Close()
+	deferredDeleteHandle, err := os.OpenFile(runCtx.CSV["deferredDeleteItems"], os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer deferredDeleteHandle.Close()
 	timeoutHandle, err := os.OpenFile(runCtx.CSV["timeouts"], os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -196,9 +213,15 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 
 	noExpiryWriter := csv.NewWriter(noExpiryHandle)
 	oldWriter := csv.NewWriter(oldHandle)
+	inferredPassedWriter := csv.NewWriter(inferredPassedHandle)
+	inferredNotPassedWriter := csv.NewWriter(inferredNotPassedHandle)
+	deferredDeleteWriter := csv.NewWriter(deferredDeleteHandle)
 	timeoutWriter := csv.NewWriter(timeoutHandle)
 	defer noExpiryWriter.Flush()
 	defer oldWriter.Flush()
+	defer inferredPassedWriter.Flush()
+	defer inferredNotPassedWriter.Flush()
+	defer deferredDeleteWriter.Flush()
 	defer timeoutWriter.Flush()
 
 	jobs := make(chan VaultInfo)
@@ -206,6 +229,9 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 	var noExpiryMu sync.Mutex
 	var oldMu sync.Mutex
 	var timeoutMu sync.Mutex
+	var inferredPassedMu sync.Mutex
+	var inferredNotPassedMu sync.Mutex
+	var deferredDeleteMu sync.Mutex
 	var timedOutMu sync.Mutex
 	var started int64
 	var completed int64
@@ -245,7 +271,7 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 			for v := range jobs {
 				atomic.AddInt64(&started, 1)
 				start := time.Now()
-				noExpRows, oldRows, timedOut := processVault(runCtx.Config, v)
+				noExpRows, oldRows, inferredPassedRows, inferredNotPassedRows, deferredDeleteRows, timedOut := processVault(runCtx.Config, v)
 				if timedOut {
 					timeoutMu.Lock()
 					_ = timeoutWriter.Write([]string{v.Subscription, v.ResourceGroup, v.VaultName, strconv.Itoa(int(time.Since(start).Seconds())), ""})
@@ -276,6 +302,30 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 					oldMu.Unlock()
 					atomic.AddInt64(&runCtx.Stats.OldRPCount, int64(len(oldRows)))
 				}
+				if len(inferredPassedRows) > 0 {
+					inferredPassedMu.Lock()
+					for _, r := range inferredPassedRows {
+						_ = inferredPassedWriter.Write(r)
+					}
+					inferredPassedWriter.Flush()
+					inferredPassedMu.Unlock()
+				}
+				if len(inferredNotPassedRows) > 0 {
+					inferredNotPassedMu.Lock()
+					for _, r := range inferredNotPassedRows {
+						_ = inferredNotPassedWriter.Write(r)
+					}
+					inferredNotPassedWriter.Flush()
+					inferredNotPassedMu.Unlock()
+				}
+				if len(deferredDeleteRows) > 0 {
+					deferredDeleteMu.Lock()
+					for _, r := range deferredDeleteRows {
+						_ = deferredDeleteWriter.Write(r)
+					}
+					deferredDeleteWriter.Flush()
+					deferredDeleteMu.Unlock()
+				}
 				atomic.AddInt64(&completed, 1)
 			}
 		}()
@@ -299,7 +349,7 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 
 // Phase 2: query backup items with no assigned policy via Azure Resource Graph.
 func phase2NoPolicy(_ context.Context, runCtx *RunContext) error {
-	q := `RecoveryServicesResources | where type =~ 'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems' | extend vaultName = tostring(split(id, '/')[8]) | extend policyId = tostring(properties.policyId) | extend policyName = tostring(properties.policyInfo.name) | extend protectionState = tostring(properties.currentProtectionState) | extend friendlyName = tostring(properties.friendlyName) | extend itemType = strcat(properties.backupManagementType, '/', properties.workloadType) | extend lastBackupTime = tostring(properties.lastBackupTime) | where isempty(policyId) and isempty(policyName) | where protectionState != 'SoftDeleted' | project subscriptionId, resourceGroup, vaultName, friendlyName, itemType, protectionState, lastBackupTime`
+	q := `RecoveryServicesResources | where type =~ 'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems' | extend vaultName = tostring(split(id, '/')[8]) | extend policyId = tostring(properties.policyId) | extend policyName = tostring(properties.policyInfo.name) | extend protectionState = tostring(properties.currentProtectionState) | extend isScheduledForDeferredDelete = tobool(properties.isScheduledForDeferredDelete) | extend friendlyName = tostring(properties.friendlyName) | extend itemType = strcat(properties.backupManagementType, '/', properties.workloadType) | extend lastBackupTime = tostring(properties.lastBackupTime) | where isempty(policyId) and isempty(policyName) | where protectionState != 'SoftDeleted' | where isScheduledForDeferredDelete != true | project subscriptionId, resourceGroup, vaultName, friendlyName, itemType, protectionState, lastBackupTime`
 	f, err := os.OpenFile(runCtx.CSV["noPolicy"], os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -310,6 +360,7 @@ func phase2NoPolicy(_ context.Context, runCtx *RunContext) error {
 
 	const pageSize = 100
 	skip := 0
+	stateCounts := map[string]int{}
 	for {
 		out, err := runAzJSON("graph", "query", "-q", q, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(skip))
 		if err != nil {
@@ -329,6 +380,11 @@ func phase2NoPolicy(_ context.Context, runCtx *RunContext) error {
 				getAny(row, "protectionState", "protectionstate"),
 				normalizeOutputTime(getAny(row, "lastBackupTime", "lastbackuptime"), runCtx.Config.OutputTimeMode),
 			}
+			ps := strings.TrimSpace(record[5])
+			if ps == "" {
+				ps = "<empty>"
+			}
+			stateCounts[ps]++
 			if strings.Contains(strings.ToLower(record[4]), "azureiaasvm") {
 				runCtx.Stats.NoPolicyVMCount++
 			}
@@ -345,6 +401,9 @@ func phase2NoPolicy(_ context.Context, runCtx *RunContext) error {
 		if total > 0 && skip >= total {
 			break
 		}
+	}
+	if err := writeStateDistribution(runCtx.CSV["noPolicyStateDist"], stateCounts); err != nil {
+		return err
 	}
 	return nil
 }
@@ -399,6 +458,7 @@ func phase3CrossReference(_ context.Context, runCtx *RunContext) error {
 	defer outf.Close()
 	ow := csv.NewWriter(outf)
 	defer ow.Flush()
+	overlapStateCounts := map[string]int{}
 
 	for {
 		row, err := inr.Read()
@@ -417,9 +477,17 @@ func phase3CrossReference(_ context.Context, runCtx *RunContext) error {
 			continue
 		}
 		runCtx.Stats.OverlapCount++
+		ps := strings.TrimSpace(row[5])
+		if ps == "" {
+			ps = "<empty>"
+		}
+		overlapStateCounts[ps]++
 		if err := ow.Write(append(row, strconv.Itoa(s.Count), s.Oldest)); err != nil {
 			return err
 		}
+	}
+	if err := writeStateDistribution(runCtx.CSV["overlapStateDist"], overlapStateCounts); err != nil {
+		return err
 	}
 	return nil
 }
@@ -499,21 +567,23 @@ func loadConfig() (Config, error) {
 	reportDir := filepath.Join(filepath.Dir(repoRoot), "rsv-reports")
 
 	cfg := Config{
-		Debug:             envBool("DEBUG", false),
-		DebugPaging:       envBool("DEBUG_PAGING", false),
-		DebugMax:          envInt("DEBUG_MAX", 3),
-		Parallel:          envInt("PARALLEL", 10),
-		SkipRecentHours:   envInt("SKIP_RECENT_HOURS", 48),
-		RPAgeMonths:       envInt("RP_AGE_MONTHS", 13),
-		CSVOutput:         envBool("CSV_OUTPUT", true),
-		VaultTimeout:      time.Duration(envInt("VAULT_TIMEOUT", 600)) * time.Second,
-		RetryVaultsCSV:    os.Getenv("RETRY_VAULTS_CSV"),
-		AutoRetryTimeouts: envBool("AUTO_RETRY_TIMEOUTS", true),
-		AutoRetryParallel: envInt("AUTO_RETRY_PARALLEL", 5),
-		AutoRetryTimeout:  time.Duration(envInt("AUTO_RETRY_TIMEOUT", 1200)) * time.Second,
-		OutputTimeMode:    normalizeOutputTimeMode(os.Getenv("REPORT_TIME_MODE")),
-		ReportDir:         reportDir,
-		TS:                ts,
+		Debug:                   envBool("DEBUG", false),
+		DebugPaging:             envBool("DEBUG_PAGING", false),
+		DebugMax:                envInt("DEBUG_MAX", 3),
+		Parallel:                envInt("PARALLEL", 10),
+		SkipRecentHours:         envInt("SKIP_RECENT_HOURS", 48),
+		RPAgeMonths:             envInt("RP_AGE_MONTHS", 13),
+		CSVOutput:               envBool("CSV_OUTPUT", true),
+		VaultTimeout:            time.Duration(envInt("VAULT_TIMEOUT", 600)) * time.Second,
+		RetryVaultsCSV:          os.Getenv("RETRY_VAULTS_CSV"),
+		AutoRetryTimeouts:       envBool("AUTO_RETRY_TIMEOUTS", true),
+		AutoRetryParallel:       envInt("AUTO_RETRY_PARALLEL", 5),
+		AutoRetryTimeout:        time.Duration(envInt("AUTO_RETRY_TIMEOUT", 1200)) * time.Second,
+		AssumedMaxRetentionDays: envInt("ASSUMED_MAX_RETENTION_DAYS", 3650),
+		InferredExcludeStates:   parseStateSet(os.Getenv("INFERRED_EXCLUDE_STATES"), "SoftDeleted"),
+		OutputTimeMode:          normalizeOutputTimeMode(os.Getenv("REPORT_TIME_MODE")),
+		ReportDir:               reportDir,
+		TS:                      ts,
 	}
 	if v := strings.TrimSpace(os.Getenv("REPORT_DIR")); v != "" {
 		cfg.ReportDir = v
@@ -544,30 +614,40 @@ func initRunContext(cfg Config) (*RunContext, error) {
 	}
 
 	csvPaths := map[string]string{
-		"noExpiry":    filepath.Join(baseDir, fmt.Sprintf("1-no-expiry-rps-%s.csv", cfg.TS)),
-		"noPolicy":    filepath.Join(baseDir, fmt.Sprintf("2-no-policy-items-%s.csv", cfg.TS)),
-		"overlap":     filepath.Join(baseDir, fmt.Sprintf("3-no-expiry-no-policy-%s.csv", cfg.TS)),
-		"oldRPs":      filepath.Join(baseDir, fmt.Sprintf("4-old-rps-%s.csv", cfg.TS)),
-		"clean":       filepath.Join(baseDir, fmt.Sprintf("5-clean-vaults-%s.csv", cfg.TS)),
-		"dirty":       filepath.Join(baseDir, fmt.Sprintf("6-dirty-vaults-%s.csv", cfg.TS)),
-		"timeouts":    filepath.Join(baseDir, fmt.Sprintf("7-timed-out-vaults-%s.csv", cfg.TS)),
-		"finalClean":  filepath.Join(baseDir, fmt.Sprintf("8-final-clean-vaults-%s.csv", cfg.TS)),
-		"finalDirty":  filepath.Join(baseDir, fmt.Sprintf("9-final-dirty-vaults-%s.csv", cfg.TS)),
-		"dirtyDetail": filepath.Join(baseDir, fmt.Sprintf("10-dirty-items-detail-%s.csv", cfg.TS)),
-		"cleanList":   filepath.Join(baseDir, fmt.Sprintf("clean-vaults-%s.list", cfg.TS)),
+		"noExpiry":                filepath.Join(baseDir, fmt.Sprintf("1-no-expiry-rps-%s.csv", cfg.TS)),
+		"noPolicy":                filepath.Join(baseDir, fmt.Sprintf("2-no-policy-items-%s.csv", cfg.TS)),
+		"overlap":                 filepath.Join(baseDir, fmt.Sprintf("3-no-expiry-no-policy-%s.csv", cfg.TS)),
+		"oldRPs":                  filepath.Join(baseDir, fmt.Sprintf("4-old-rps-%s.csv", cfg.TS)),
+		"clean":                   filepath.Join(baseDir, fmt.Sprintf("5-clean-vaults-%s.csv", cfg.TS)),
+		"dirty":                   filepath.Join(baseDir, fmt.Sprintf("6-dirty-vaults-%s.csv", cfg.TS)),
+		"timeouts":                filepath.Join(baseDir, fmt.Sprintf("7-timed-out-vaults-%s.csv", cfg.TS)),
+		"finalClean":              filepath.Join(baseDir, fmt.Sprintf("8-final-clean-vaults-%s.csv", cfg.TS)),
+		"finalDirty":              filepath.Join(baseDir, fmt.Sprintf("9-final-dirty-vaults-%s.csv", cfg.TS)),
+		"dirtyDetail":             filepath.Join(baseDir, fmt.Sprintf("10-dirty-items-detail-%s.csv", cfg.TS)),
+		"noPolicyStateDist":       filepath.Join(baseDir, fmt.Sprintf("11-no-policy-protectionstate-distribution-%s.csv", cfg.TS)),
+		"overlapStateDist":        filepath.Join(baseDir, fmt.Sprintf("12-overlap-protectionstate-distribution-%s.csv", cfg.TS)),
+		"inferredExpiryPassed":    filepath.Join(baseDir, fmt.Sprintf("13-inferred-expiry-passed-%s.csv", cfg.TS)),
+		"inferredExpiryNotPassed": filepath.Join(baseDir, fmt.Sprintf("14-inferred-expiry-not-passed-%s.csv", cfg.TS)),
+		"deferredDeleteItems":     filepath.Join(baseDir, fmt.Sprintf("15-deferred-delete-items-%s.csv", cfg.TS)),
+		"cleanList":               filepath.Join(baseDir, fmt.Sprintf("clean-vaults-%s.list", cfg.TS)),
 	}
 
 	headers := map[string]string{
-		"noExpiry":    "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType",
-		"noPolicy":    "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime",
-		"overlap":     "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp",
-		"oldRPs":      "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,expiryTime",
-		"clean":       "subscription,resourceGroup,vaultName",
-		"dirty":       "subscription,resourceGroup,vaultName,reason",
-		"timeouts":    "subscription,resourceGroup,vaultName,elapsedSeconds,pid",
-		"finalClean":  "subscription,resourceGroup,vaultName",
-		"finalDirty":  "subscription,resourceGroup,vaultName,reason",
-		"dirtyDetail": "subscription,resourceGroup,vaultName,reason,itemName,recoveryPointTime,recoveryPointType,expiryTime",
+		"noExpiry":                "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,protectionState",
+		"noPolicy":                "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime",
+		"overlap":                 "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,lastBackupTime,noExpiryRpCount,oldestNoExpiryRp",
+		"oldRPs":                  "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,expiryTime,protectionState",
+		"clean":                   "subscription,resourceGroup,vaultName",
+		"dirty":                   "subscription,resourceGroup,vaultName,reason",
+		"timeouts":                "subscription,resourceGroup,vaultName,elapsedSeconds,pid",
+		"finalClean":              "subscription,resourceGroup,vaultName",
+		"finalDirty":              "subscription,resourceGroup,vaultName,reason",
+		"dirtyDetail":             "subscription,resourceGroup,vaultName,reason,itemName,recoveryPointTime,recoveryPointType,expiryTime",
+		"noPolicyStateDist":       "protectionState,count",
+		"overlapStateDist":        "protectionState,count",
+		"inferredExpiryPassed":    "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,inferredExpiryTime,inferenceBase,retentionDays,policyId,policyName,protectionState",
+		"inferredExpiryNotPassed": "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,inferredExpiryTime,inferenceBase,retentionDays,policyId,policyName,protectionState",
+		"deferredDeleteItems":     "subscription,resourceGroup,vaultName,itemName,protectionState,deferredDeleteTimeInUTC,deferredDeleteTimeRemaining,softDeleteRetentionPeriod,policyId,policyName",
 	}
 	for key, path := range csvPaths {
 		if h, ok := headers[key]; ok {
@@ -611,28 +691,39 @@ func ensureAzureReady() error {
 }
 
 // Vault scanning and reconciliation helpers.
-func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
+func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]string, [][]string, [][]string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.VaultTimeout)
 	defer cancel()
 
 	itemsJSON, err := runAzJSONWithContext(ctx, "backup", "item", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, nil, true
+			return nil, nil, nil, nil, nil, true
 		}
 		if !isResourceNotFoundErr(err) {
 			log.Printf("[phase1] item list failed for vault %s/%s: %v", vault.ResourceGroup, vault.VaultName, err)
 		}
-		return nil, nil, false
+		return nil, nil, nil, nil, nil, false
 	}
 	var items []struct {
 		Name       string `json:"name"`
 		Properties struct {
-			ContainerName string `json:"containerName"`
+			ContainerName                string `json:"containerName"`
+			PolicyID                     string `json:"policyId"`
+			PolicyName                   string `json:"policyName"`
+			CurrentProtectionState       string `json:"currentProtectionState"`
+			ProtectionState              string `json:"protectionState"`
+			IsScheduledForDeferredDelete bool   `json:"isScheduledForDeferredDelete"`
+			DeferredDeleteTimeInUTC      string `json:"deferredDeleteTimeInUTC"`
+			DeferredDeleteTimeRemaining  string `json:"deferredDeleteTimeRemaining"`
+			SoftDeleteRetentionPeriod    int    `json:"softDeleteRetentionPeriod"`
+			PolicyInfo                   struct {
+				Name string `json:"name"`
+			} `json:"policyInfo"`
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal(itemsJSON, &items); err != nil {
-		return nil, nil, false
+		return nil, nil, nil, nil, nil, false
 	}
 
 	now := time.Now().UTC()
@@ -645,12 +736,44 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 
 	noExpiryRows := make([][]string, 0)
 	oldRows := make([][]string, 0)
+	inferredPassedRows := make([][]string, 0)
+	inferredNotPassedRows := make([][]string, 0)
+	deferredDeleteRows := make([][]string, 0)
 	for _, item := range items {
+		itemProtectionState := strings.TrimSpace(item.Properties.CurrentProtectionState)
+		if itemProtectionState == "" {
+			itemProtectionState = strings.TrimSpace(item.Properties.ProtectionState)
+		}
+		if itemProtectionState == "" {
+			itemProtectionState = "<unknown>"
+		}
+		if item.Properties.IsScheduledForDeferredDelete {
+			deferredDeleteRows = append(deferredDeleteRows, []string{
+				vault.Subscription,
+				vault.ResourceGroup,
+				vault.VaultName,
+				item.Name,
+				itemProtectionState,
+				normalizeOutputTime(item.Properties.DeferredDeleteTimeInUTC, cfg.OutputTimeMode),
+				item.Properties.DeferredDeleteTimeRemaining,
+				strconv.Itoa(item.Properties.SoftDeleteRetentionPeriod),
+				strings.TrimSpace(item.Properties.PolicyID),
+				strings.TrimSpace(item.Properties.PolicyName),
+			})
+			// Optimization + semantics: skip RP enumeration for deferred-delete items.
+			continue
+		}
+		itemPolicyID := strings.TrimSpace(item.Properties.PolicyID)
+		itemPolicyName := strings.TrimSpace(item.Properties.PolicyName)
+		if itemPolicyName == "" {
+			itemPolicyName = strings.TrimSpace(item.Properties.PolicyInfo.Name)
+		}
+		policyDays, policyBase, policyName := inferPolicyRetentionDays(ctx, vault, itemPolicyID, itemPolicyName)
 		containerName := "IaasVMContainer;" + item.Properties.ContainerName
 		rpJSON, err := runAzJSONWithContext(ctx, "backup", "recoverypoint", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--container-name", containerName, "--item-name", item.Name, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, nil, true
+				return nil, nil, nil, nil, nil, true
 			}
 			if !isResourceNotFoundErr(err) {
 				log.Printf("[phase1] recoverypoint list failed for vault %s/%s item %s: %v", vault.ResourceGroup, vault.VaultName, item.Name, err)
@@ -690,6 +813,7 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 					normalizeOutputTime(rp.Properties.RecoveryPointTime, cfg.OutputTimeMode),
 					rp.Properties.RecoveryPointType,
 					expiry,
+					itemProtectionState,
 				})
 			}
 			if rp.Properties.RecoveryPointProperties.ExpiryTime == nil {
@@ -703,11 +827,41 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, bool) {
 					item.Name,
 					normalizeOutputTime(rp.Properties.RecoveryPointTime, cfg.OutputTimeMode),
 					rp.Properties.RecoveryPointType,
+					itemProtectionState,
 				})
+				if _, excluded := cfg.InferredExcludeStates[strings.ToLower(itemProtectionState)]; excluded {
+					continue
+				}
+				inferredDays := policyDays
+				inferenceBase := policyBase
+				if inferredDays <= 0 {
+					inferredDays = cfg.AssumedMaxRetentionDays
+					inferenceBase = "Assumed_Max_Retention"
+				}
+				inferredExpiry := t.AddDate(0, 0, inferredDays).UTC()
+				outRow := []string{
+					vault.Subscription,
+					vault.ResourceGroup,
+					vault.VaultName,
+					item.Name,
+					normalizeOutputTime(rp.Properties.RecoveryPointTime, cfg.OutputTimeMode),
+					rp.Properties.RecoveryPointType,
+					formatOutputTime(inferredExpiry, cfg.OutputTimeMode),
+					inferenceBase,
+					strconv.Itoa(inferredDays),
+					itemPolicyID,
+					policyName,
+					itemProtectionState,
+				}
+				if !inferredExpiry.After(now) {
+					inferredPassedRows = append(inferredPassedRows, outRow)
+				} else {
+					inferredNotPassedRows = append(inferredNotPassedRows, outRow)
+				}
 			}
 		}
 	}
-	return noExpiryRows, oldRows, false
+	return noExpiryRows, oldRows, inferredPassedRows, inferredNotPassedRows, deferredDeleteRows, false
 }
 
 func loadVaults(retryPath string) ([]VaultInfo, error) {
@@ -946,6 +1100,28 @@ func writeCleanList(base *RunContext, dirty map[string]string) error {
 	return nil
 }
 
+func writeStateDistribution(path string, counts map[string]int) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if err := w.Write([]string{k, strconv.Itoa(counts[k])}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CSV readers and collectors.
 func readVaultsCSV(path string) ([]VaultInfo, error) {
 	f, err := os.Open(path)
@@ -1050,6 +1226,103 @@ func readSet(path string) (map[string]struct{}, error) {
 		out[vaultKey(VaultInfo{Subscription: row[0], ResourceGroup: row[1], VaultName: row[2]})] = struct{}{}
 	}
 	return out, nil
+}
+
+type policyRetentionInfo struct {
+	Days int
+	Name string
+}
+
+var policyRetentionCache sync.Map // key=sub|rg|vault|policyName
+
+func inferPolicyRetentionDays(ctx context.Context, vault VaultInfo, policyID, policyName string) (int, string, string) {
+	name := strings.TrimSpace(policyName)
+	if name == "" && policyID != "" {
+		parts := strings.Split(policyID, "/")
+		name = parts[len(parts)-1]
+	}
+	if name == "" {
+		return 0, "", ""
+	}
+	cacheKey := strings.ToLower(vault.Subscription + "|" + vault.ResourceGroup + "|" + vault.VaultName + "|" + name)
+	if v, ok := policyRetentionCache.Load(cacheKey); ok {
+		c := v.(policyRetentionInfo)
+		if c.Days > 0 {
+			return c.Days, "RSV_Assigned_Policy", c.Name
+		}
+		return 0, "", c.Name
+	}
+
+	policyJSON, err := runAzJSONWithContext(ctx,
+		"backup", "policy", "show",
+		"--subscription", vault.Subscription,
+		"--resource-group", vault.ResourceGroup,
+		"--vault-name", vault.VaultName,
+		"--name", name,
+	)
+	if err != nil {
+		policyRetentionCache.Store(cacheKey, policyRetentionInfo{Days: 0, Name: name})
+		return 0, "", name
+	}
+
+	var payload any
+	if err := json.Unmarshal(policyJSON, &payload); err != nil {
+		policyRetentionCache.Store(cacheKey, policyRetentionInfo{Days: 0, Name: name})
+		return 0, "", name
+	}
+	days := maxRetentionDaysFromAny(payload)
+	policyRetentionCache.Store(cacheKey, policyRetentionInfo{Days: days, Name: name})
+	if days > 0 {
+		return days, "RSV_Assigned_Policy", name
+	}
+	return 0, "", name
+}
+
+func maxRetentionDaysFromAny(v any) int {
+	switch t := v.(type) {
+	case map[string]any:
+		// common shape: {durationType: Days|Weeks|Months|Years, count: N}
+		dt := strings.ToLower(getAny(t, "durationType", "duration_type", "DurationType"))
+		cnt := getInt(t, "count", "Count", "durationCountInDays", "durationCountInWeeks", "durationCountInMonths", "durationCountInYears")
+		best := 0
+		if cnt > 0 {
+			switch dt {
+			case "days":
+				best = max(best, cnt)
+			case "weeks":
+				best = max(best, cnt*7)
+			case "months":
+				best = max(best, cnt*30)
+			case "years":
+				best = max(best, cnt*365)
+			default:
+				if v2 := getInt(t, "durationCountInDays"); v2 > 0 {
+					best = max(best, v2)
+				}
+				if v2 := getInt(t, "durationCountInWeeks"); v2 > 0 {
+					best = max(best, v2*7)
+				}
+				if v2 := getInt(t, "durationCountInMonths"); v2 > 0 {
+					best = max(best, v2*30)
+				}
+				if v2 := getInt(t, "durationCountInYears"); v2 > 0 {
+					best = max(best, v2*365)
+				}
+			}
+		}
+		for _, child := range t {
+			best = max(best, maxRetentionDaysFromAny(child))
+		}
+		return best
+	case []any:
+		best := 0
+		for _, child := range t {
+			best = max(best, maxRetentionDaysFromAny(child))
+		}
+		return best
+	default:
+		return 0
+	}
 }
 
 // Generic utility helpers.
@@ -1269,6 +1542,8 @@ func printConfig(cfg Config) {
 	log.Printf("[*] VAULT_TIMEOUT=%s, AUTO_RETRY=%t (%d/%s)", cfg.VaultTimeout, cfg.AutoRetryTimeouts, cfg.AutoRetryParallel, cfg.AutoRetryTimeout)
 	log.Printf("[*] DEBUG_PAGING=%t", cfg.DebugPaging)
 	log.Printf("[*] REPORT_TIME_MODE=%s", cfg.OutputTimeMode)
+	log.Printf("[*] ASSUMED_MAX_RETENTION_DAYS=%d", cfg.AssumedMaxRetentionDays)
+	log.Printf("[*] INFERRED_EXCLUDE_STATES=%s", joinStateSet(cfg.InferredExcludeStates))
 	if cfg.RetryVaultsCSV != "" {
 		log.Printf("[*] RETRY_VAULTS_CSV=%s", cfg.RetryVaultsCSV)
 	}
@@ -1333,4 +1608,35 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%ds", secs)
 	}
 	return fmt.Sprintf("%dm %ds", secs/60, secs%60)
+}
+
+func parseStateSet(raw string, defaults ...string) map[string]struct{} {
+	set := map[string]struct{}{}
+	src := strings.TrimSpace(raw)
+	if src == "" {
+		for _, d := range defaults {
+			if t := strings.ToLower(strings.TrimSpace(d)); t != "" {
+				set[t] = struct{}{}
+			}
+		}
+		return set
+	}
+	for _, part := range strings.Split(src, ",") {
+		if t := strings.ToLower(strings.TrimSpace(part)); t != "" {
+			set[t] = struct{}{}
+		}
+	}
+	return set
+}
+
+func joinStateSet(set map[string]struct{}) string {
+	if len(set) == 0 {
+		return "<none>"
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
