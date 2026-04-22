@@ -909,10 +909,6 @@ func writeDirtyDetail(base *RunContext, dirty map[string]string) error {
 	if err := addFromCSV(base.CSV["overlap"], "no-policy-no-expiry", 3, -1, -1, -1); err != nil {
 		return err
 	}
-	// file 1: no-expiry RPs (itemName=col3, rpTime=col4, rpType=col5)
-	if err := addFromCSV(base.CSV["noExpiry"], "no-expiry-rp", 3, 4, 5, -1); err != nil {
-		return err
-	}
 	// file 4: old RPs (itemName=col3, rpTime=col4, rpType=col5, expiry=col6)
 	if err := addFromCSV(base.CSV["oldRPs"], "old-rp", 3, 4, 5, 6); err != nil {
 		return err
