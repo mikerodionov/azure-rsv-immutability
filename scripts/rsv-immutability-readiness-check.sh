@@ -540,6 +540,7 @@ while true; do
   | extend itemType = strcat(properties.backupManagementType, '/', properties.workloadType)
   | extend lastBackupTime = tostring(properties.lastBackupTime)
   | where isempty(policyId) and isempty(policyName)
+  | where protectionState != 'SoftDeleted'
   | project subscriptionId, resourceGroup, vaultName, friendlyName, itemType, protectionState, lastBackupTime
   " --first 1000 --skip $NO_POLICY_SKIP 2>/dev/null)
 
