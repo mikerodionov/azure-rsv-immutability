@@ -46,17 +46,19 @@ type VaultInfo struct {
 }
 
 type FullStats struct {
-	VaultCount      int
-	NoExpiryCount   int64
-	OldRPCount      int64
-	NoPolicyCount   int64
-	NoPolicyVMCount int64
-	OverlapCount    int64
-	CleanCount      int64
-	DirtyCount      int64
-	TimeoutCount    int64
-	FinalCleanCount int64
-	FinalDirtyCount int64
+	VaultCount             int
+	NoExpiryCount          int64
+	OldRPCount             int64
+	NoPolicyCount          int64
+	NoPolicyVMCount        int64
+	OverlapCount           int64
+	CleanCount             int64
+	DirtyCount             int64
+	TimeoutCount           int64
+	RetryResolvedCount     int64
+	RetryStillTimeoutCount int64
+	FinalCleanCount        int64
+	FinalDirtyCount        int64
 }
 
 type RunContext struct {
@@ -200,11 +202,6 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 		return err
 	}
 	defer inferredNotPassedHandle.Close()
-	deferredDeleteHandle, err := os.OpenFile(runCtx.CSV["deferredDeleteItems"], os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer deferredDeleteHandle.Close()
 	timeoutHandle, err := os.OpenFile(runCtx.CSV["timeouts"], os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -215,13 +212,11 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 	oldWriter := csv.NewWriter(oldHandle)
 	inferredPassedWriter := csv.NewWriter(inferredPassedHandle)
 	inferredNotPassedWriter := csv.NewWriter(inferredNotPassedHandle)
-	deferredDeleteWriter := csv.NewWriter(deferredDeleteHandle)
 	timeoutWriter := csv.NewWriter(timeoutHandle)
 	defer noExpiryWriter.Flush()
 	defer oldWriter.Flush()
 	defer inferredPassedWriter.Flush()
 	defer inferredNotPassedWriter.Flush()
-	defer deferredDeleteWriter.Flush()
 	defer timeoutWriter.Flush()
 
 	jobs := make(chan VaultInfo)
@@ -231,7 +226,6 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 	var timeoutMu sync.Mutex
 	var inferredPassedMu sync.Mutex
 	var inferredNotPassedMu sync.Mutex
-	var deferredDeleteMu sync.Mutex
 	var timedOutMu sync.Mutex
 	var started int64
 	var completed int64
@@ -271,7 +265,7 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 			for v := range jobs {
 				atomic.AddInt64(&started, 1)
 				start := time.Now()
-				noExpRows, oldRows, inferredPassedRows, inferredNotPassedRows, deferredDeleteRows, timedOut := processVault(runCtx.Config, v)
+				noExpRows, oldRows, inferredPassedRows, inferredNotPassedRows, timedOut := processVault(runCtx.Config, v)
 				if timedOut {
 					timeoutMu.Lock()
 					_ = timeoutWriter.Write([]string{v.Subscription, v.ResourceGroup, v.VaultName, strconv.Itoa(int(time.Since(start).Seconds())), ""})
@@ -317,14 +311,6 @@ func phase1RecoveryPoints(_ context.Context, runCtx *RunContext) error {
 					}
 					inferredNotPassedWriter.Flush()
 					inferredNotPassedMu.Unlock()
-				}
-				if len(deferredDeleteRows) > 0 {
-					deferredDeleteMu.Lock()
-					for _, r := range deferredDeleteRows {
-						_ = deferredDeleteWriter.Write(r)
-					}
-					deferredDeleteWriter.Flush()
-					deferredDeleteMu.Unlock()
 				}
 				atomic.AddInt64(&completed, 1)
 			}
@@ -405,6 +391,57 @@ func phase2NoPolicy(_ context.Context, runCtx *RunContext) error {
 	if err := writeStateDistribution(runCtx.CSV["noPolicyStateDist"], stateCounts); err != nil {
 		return err
 	}
+
+	// Query soft-deleted items via ARG for report 15 audit trail.
+	// The backup API (az backup item list) does not return SoftDeleted items,
+	// so ARG is the only source for this data.
+	sdq := `RecoveryServicesResources | where type =~ 'microsoft.recoveryservices/vaults/backupfabrics/protectioncontainers/protecteditems' | extend vaultName = tostring(split(id, '/')[8]) | extend protectionState = tostring(properties.currentProtectionState) | extend isScheduledForDeferredDelete = tobool(properties.isScheduledForDeferredDelete) | extend friendlyName = tostring(properties.friendlyName) | extend itemType = strcat(properties.backupManagementType, '/', properties.workloadType) | extend deferredDeleteTimeInUTC = tostring(properties.deferredDeleteTimeInUTC) | extend deferredDeleteTimeRemaining = tostring(properties.deferredDeleteTimeRemaining) | where protectionState == 'SoftDeleted' or isScheduledForDeferredDelete == true | project subscriptionId, resourceGroup, vaultName, friendlyName, itemType, protectionState, isScheduledForDeferredDelete, deferredDeleteTimeInUTC, deferredDeleteTimeRemaining`
+	sdf, err := os.OpenFile(runCtx.CSV["softDeletedItems"], os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer sdf.Close()
+	sdw := csv.NewWriter(sdf)
+	defer sdw.Flush()
+
+	sdSkip := 0
+	sdCount := 0
+	for {
+		out, err := runAzJSON("graph", "query", "-q", sdq, "--first", strconv.Itoa(pageSize), "--skip", strconv.Itoa(sdSkip))
+		if err != nil {
+			return err
+		}
+		rows, total, _, err := extractDataWithTotal(out)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			record := []string{
+				getAny(row, "subscriptionId", "subscriptionID"),
+				getAny(row, "resourceGroup", "resourcegroup"),
+				getAny(row, "vaultName", "vaultname"),
+				getAny(row, "friendlyName", "friendlyname"),
+				getAny(row, "itemType", "itemtype"),
+				getAny(row, "protectionState", "protectionstate"),
+				getAny(row, "isScheduledForDeferredDelete", "isscheduledfordeferreddelete"),
+				normalizeOutputTime(getAny(row, "deferredDeleteTimeInUTC", "deferreddeletetimeinutc"), runCtx.Config.OutputTimeMode),
+				getAny(row, "deferredDeleteTimeRemaining", "deferreddeletetimeremaining"),
+			}
+			sdCount++
+			if err := sdw.Write(record); err != nil {
+				return err
+			}
+		}
+		sdw.Flush()
+		if len(rows) == 0 {
+			break
+		}
+		sdSkip += pageSize
+		if total > 0 && sdSkip >= total {
+			break
+		}
+	}
+	log.Printf("[phase2] soft-deleted items (report 15): %d", sdCount)
 	return nil
 }
 
@@ -628,7 +665,7 @@ func initRunContext(cfg Config) (*RunContext, error) {
 		"overlapStateDist":        filepath.Join(baseDir, fmt.Sprintf("12-overlap-protectionstate-distribution-%s.csv", cfg.TS)),
 		"inferredExpiryPassed":    filepath.Join(baseDir, fmt.Sprintf("13-inferred-expiry-passed-%s.csv", cfg.TS)),
 		"inferredExpiryNotPassed": filepath.Join(baseDir, fmt.Sprintf("14-inferred-expiry-not-passed-%s.csv", cfg.TS)),
-		"deferredDeleteItems":     filepath.Join(baseDir, fmt.Sprintf("15-deferred-delete-items-%s.csv", cfg.TS)),
+		"softDeletedItems":        filepath.Join(baseDir, fmt.Sprintf("15-soft-deleted-items-%s.csv", cfg.TS)),
 		"cleanList":               filepath.Join(baseDir, fmt.Sprintf("clean-vaults-%s.list", cfg.TS)),
 	}
 
@@ -642,12 +679,12 @@ func initRunContext(cfg Config) (*RunContext, error) {
 		"timeouts":                "subscription,resourceGroup,vaultName,elapsedSeconds,pid",
 		"finalClean":              "subscription,resourceGroup,vaultName",
 		"finalDirty":              "subscription,resourceGroup,vaultName,reason",
-		"dirtyDetail":             "subscription,resourceGroup,vaultName,reason,itemName,recoveryPointTime,recoveryPointType,expiryTime",
+		"dirtyDetail":             "subscription,resourceGroup,vaultName,reason,itemName,recoveryPointTime,recoveryPointType,expiryTime,protectionState",
 		"noPolicyStateDist":       "protectionState,count",
 		"overlapStateDist":        "protectionState,count",
 		"inferredExpiryPassed":    "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,inferredExpiryTime,inferenceBase,retentionDays,policyId,policyName,protectionState",
 		"inferredExpiryNotPassed": "subscription,resourceGroup,vaultName,itemName,recoveryPointTime,recoveryPointType,inferredExpiryTime,inferenceBase,retentionDays,policyId,policyName,protectionState",
-		"deferredDeleteItems":     "subscription,resourceGroup,vaultName,itemName,protectionState,deferredDeleteTimeInUTC,deferredDeleteTimeRemaining,softDeleteRetentionPeriod,policyId,policyName",
+		"softDeletedItems":        "subscriptionId,resourceGroup,vaultName,friendlyName,itemType,protectionState,isScheduledForDeferredDelete,deferredDeleteTimeInUTC,deferredDeleteTimeRemaining",
 	}
 	for key, path := range csvPaths {
 		if h, ok := headers[key]; ok {
@@ -691,19 +728,19 @@ func ensureAzureReady() error {
 }
 
 // Vault scanning and reconciliation helpers.
-func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]string, [][]string, [][]string, bool) {
+func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]string, [][]string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.VaultTimeout)
 	defer cancel()
 
 	itemsJSON, err := runAzJSONWithContext(ctx, "backup", "item", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, nil, nil, nil, nil, true
+			return nil, nil, nil, nil, true
 		}
 		if !isResourceNotFoundErr(err) {
 			log.Printf("[phase1] item list failed for vault %s/%s: %v", vault.ResourceGroup, vault.VaultName, err)
 		}
-		return nil, nil, nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	var items []struct {
 		Name       string `json:"name"`
@@ -723,7 +760,7 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]stri
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal(itemsJSON, &items); err != nil {
-		return nil, nil, nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 
 	now := time.Now().UTC()
@@ -738,7 +775,6 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]stri
 	oldRows := make([][]string, 0)
 	inferredPassedRows := make([][]string, 0)
 	inferredNotPassedRows := make([][]string, 0)
-	deferredDeleteRows := make([][]string, 0)
 	for _, item := range items {
 		itemProtectionState := strings.TrimSpace(item.Properties.CurrentProtectionState)
 		if itemProtectionState == "" {
@@ -747,20 +783,9 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]stri
 		if itemProtectionState == "" {
 			itemProtectionState = "<unknown>"
 		}
-		if item.Properties.IsScheduledForDeferredDelete {
-			deferredDeleteRows = append(deferredDeleteRows, []string{
-				vault.Subscription,
-				vault.ResourceGroup,
-				vault.VaultName,
-				item.Name,
-				itemProtectionState,
-				normalizeOutputTime(item.Properties.DeferredDeleteTimeInUTC, cfg.OutputTimeMode),
-				item.Properties.DeferredDeleteTimeRemaining,
-				strconv.Itoa(item.Properties.SoftDeleteRetentionPeriod),
-				strings.TrimSpace(item.Properties.PolicyID),
-				strings.TrimSpace(item.Properties.PolicyName),
-			})
-			// Optimization + semantics: skip RP enumeration for deferred-delete items.
+		// Belt-and-suspenders: skip soft-delete items if the backup API ever starts returning them.
+		// Currently az backup item list does NOT return SoftDeleted items — report 15 is built from ARG in phase 2.
+		if item.Properties.IsScheduledForDeferredDelete || strings.EqualFold(itemProtectionState, "SoftDeleted") {
 			continue
 		}
 		itemPolicyID := strings.TrimSpace(item.Properties.PolicyID)
@@ -773,7 +798,7 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]stri
 		rpJSON, err := runAzJSONWithContext(ctx, "backup", "recoverypoint", "list", "--subscription", vault.Subscription, "--resource-group", vault.ResourceGroup, "--vault-name", vault.VaultName, "--container-name", containerName, "--item-name", item.Name, "--backup-management-type", "AzureIaasVM", "--workload-type", "VM")
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, nil, nil, nil, nil, true
+				return nil, nil, nil, nil, true
 			}
 			if !isResourceNotFoundErr(err) {
 				log.Printf("[phase1] recoverypoint list failed for vault %s/%s item %s: %v", vault.ResourceGroup, vault.VaultName, item.Name, err)
@@ -861,7 +886,7 @@ func processVault(cfg Config, vault VaultInfo) ([][]string, [][]string, [][]stri
 			}
 		}
 	}
-	return noExpiryRows, oldRows, inferredPassedRows, inferredNotPassedRows, deferredDeleteRows, false
+	return noExpiryRows, oldRows, inferredPassedRows, inferredNotPassedRows, false
 }
 
 func loadVaults(retryPath string) ([]VaultInfo, error) {
@@ -928,17 +953,23 @@ func reconcileFinal(base, retry *RunContext) error {
 	}
 
 	finalDirty := map[string]string{}
+	var retryResolved, retryStillTimeout int64
 	for _, v := range base.AllVaults {
 		k := vaultKey(v)
 		if _, wasTimeout := baseTimeout[k]; wasTimeout {
 			if _, stillTimeout := retryTimeout[k]; stillTimeout {
+				retryStillTimeout++
 				if r, ok := retryDirty[k]; ok && r != "" {
 					finalDirty[k] = r
 				} else {
 					finalDirty[k] = "timeout"
 				}
-			} else if r, ok := retryDirty[k]; ok {
-				finalDirty[k] = r
+			} else {
+				retryResolved++
+				if r, ok := retryDirty[k]; ok {
+					finalDirty[k] = r
+				}
+				// else: retry completed and vault is clean — not added to finalDirty
 			}
 			continue
 		}
@@ -949,9 +980,62 @@ func reconcileFinal(base, retry *RunContext) error {
 	if err := writeFinal(base, finalDirty); err != nil {
 		return err
 	}
+	base.Stats.RetryResolvedCount = retryResolved
+	base.Stats.RetryStillTimeoutCount = retryStillTimeout
 	base.Stats.FinalDirtyCount = int64(len(finalDirty))
 	base.Stats.FinalCleanCount = int64(len(base.AllVaults) - len(finalDirty))
+	log.Printf("[reconcile] %d timed-out vaults retried: %d resolved, %d still timed out", retryResolved+retryStillTimeout, retryResolved, retryStillTimeout)
+
+	// Rewrite report 7 with retryOutcome column so it's self-explanatory
+	if retry != nil {
+		if err := rewriteTimeoutsWithRetryOutcome(base.CSV["timeouts"], retryTimeout, retryDirty); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// rewriteTimeoutsWithRetryOutcome rewrites report 7 in place, appending a retryOutcome column.
+// Values: "resolved-clean", "resolved-dirty:<reason>", "still-timeout".
+func rewriteTimeoutsWithRetryOutcome(path string, retryTimeout map[string]struct{}, retryDirty map[string]string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	r := csv.NewReader(f)
+	allRows, err := r.ReadAll()
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if len(allRows) == 0 {
+		return nil
+	}
+	// Append header
+	allRows[0] = append(allRows[0], "retryOutcome")
+	for i := 1; i < len(allRows); i++ {
+		rec := allRows[i]
+		if len(rec) < 3 {
+			allRows[i] = append(rec, "")
+			continue
+		}
+		k := strings.ToLower(rec[0] + "|" + rec[1] + "|" + rec[2])
+		if _, still := retryTimeout[k]; still {
+			allRows[i] = append(rec, "still-timeout")
+		} else if reason, dirty := retryDirty[k]; dirty {
+			allRows[i] = append(rec, "resolved-dirty:"+reason)
+		} else {
+			allRows[i] = append(rec, "resolved-clean")
+		}
+	}
+	wf, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer wf.Close()
+	w := csv.NewWriter(wf)
+	defer w.Flush()
+	return w.WriteAll(allRows)
 }
 
 func writeFinal(base *RunContext, dirty map[string]string) error {
@@ -1012,11 +1096,11 @@ func writeDirtyDetail(base *RunContext, dirty map[string]string) error {
 
 	// Collect items from no-expiry RPs (file 1)
 	type detailRow struct {
-		sub, rg, vault, reason, item, rpTime, rpType, expiry string
+		sub, rg, vault, reason, item, rpTime, rpType, expiry, protectionState string
 	}
 	var rows []detailRow
 
-	addFromCSV := func(path, reason string, itemCol, rpTimeCol, rpTypeCol, expiryCol int) error {
+	addFromCSV := func(path, reason string, itemCol, rpTimeCol, rpTypeCol, expiryCol, stateCol int) error {
 		f, err := os.Open(path)
 		if err != nil {
 			return err
@@ -1041,7 +1125,7 @@ func writeDirtyDetail(base *RunContext, dirty map[string]string) error {
 			if _, ok := dirtyVaults[k]; !ok {
 				continue
 			}
-			item, rpTime, rpType, expiry := "", "", "", ""
+			item, rpTime, rpType, expiry, state := "", "", "", "", ""
 			if itemCol >= 0 && itemCol < len(rec) {
 				item = rec[itemCol]
 			}
@@ -1054,17 +1138,20 @@ func writeDirtyDetail(base *RunContext, dirty map[string]string) error {
 			if expiryCol >= 0 && expiryCol < len(rec) {
 				expiry = rec[expiryCol]
 			}
-			rows = append(rows, detailRow{rec[0], rec[1], rec[2], reason, item, rpTime, rpType, expiry})
+			if stateCol >= 0 && stateCol < len(rec) {
+				state = rec[stateCol]
+			}
+			rows = append(rows, detailRow{rec[0], rec[1], rec[2], reason, item, rpTime, rpType, expiry, state})
 		}
 		return nil
 	}
 
-	// file 3: no-expiry + no-policy overlap (friendlyName=col3)
-	if err := addFromCSV(base.CSV["overlap"], "no-policy-no-expiry", 3, -1, -1, -1); err != nil {
+	// file 3: no-expiry + no-policy overlap (friendlyName=col3, protectionState=col5)
+	if err := addFromCSV(base.CSV["overlap"], "no-policy-no-expiry", 3, -1, -1, -1, 5); err != nil {
 		return err
 	}
-	// file 4: old RPs (itemName=col3, rpTime=col4, rpType=col5, expiry=col6)
-	if err := addFromCSV(base.CSV["oldRPs"], "old-rp", 3, 4, 5, 6); err != nil {
+	// file 4: old RPs (itemName=col3, rpTime=col4, rpType=col5, expiry=col6, protectionState=col7)
+	if err := addFromCSV(base.CSV["oldRPs"], "old-rp", 3, 4, 5, 6, 7); err != nil {
 		return err
 	}
 
@@ -1076,7 +1163,7 @@ func writeDirtyDetail(base *RunContext, dirty map[string]string) error {
 	w := csv.NewWriter(df)
 	defer w.Flush()
 	for _, r := range rows {
-		if err := w.Write([]string{r.sub, r.rg, r.vault, r.reason, r.item, r.rpTime, r.rpType, r.expiry}); err != nil {
+		if err := w.Write([]string{r.sub, r.rg, r.vault, r.reason, r.item, r.rpTime, r.rpType, r.expiry, r.protectionState}); err != nil {
 			return err
 		}
 	}
@@ -1562,7 +1649,11 @@ func printSummary(runCtx *RunContext, elapsed time.Duration) {
 	fmt.Printf("  %-40s %d\n", "Old RPs:", runCtx.Stats.OldRPCount)
 	fmt.Printf("  %-40s %d\n", "Clean vaults:", runCtx.Stats.CleanCount)
 	fmt.Printf("  %-40s %d\n", "Dirty vaults:", runCtx.Stats.DirtyCount)
-	fmt.Printf("  %-40s %d\n", "Timed-out vaults:", runCtx.Stats.TimeoutCount)
+	fmt.Printf("  %-40s %d\n", "Timed-out vaults (first pass):", runCtx.Stats.TimeoutCount)
+	if runCtx.Stats.RetryResolvedCount > 0 || runCtx.Stats.RetryStillTimeoutCount > 0 {
+		fmt.Printf("  %-40s %d\n", "  └ Resolved by auto-retry:", runCtx.Stats.RetryResolvedCount)
+		fmt.Printf("  %-40s %d\n", "  └ Still timed out after retry:", runCtx.Stats.RetryStillTimeoutCount)
+	}
 	if runCtx.Config.RetryVaultsCSV == "" {
 		fmt.Printf("  %-40s %d\n", "Final clean vaults:", runCtx.Stats.FinalCleanCount)
 		fmt.Printf("  %-40s %d\n", "Final dirty vaults:", runCtx.Stats.FinalDirtyCount)

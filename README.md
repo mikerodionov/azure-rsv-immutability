@@ -16,40 +16,121 @@ Scans all Recovery Services Vaults across subscriptions and produces CSV reports
 
 CSV reports are written to `../rsv-reports/` (one level above the repo) so they are never at risk of being lost during git operations.
 
+### Phase Logic
+
+The tool runs in **4 sequential phases**, each building on the previous. All data collection happens in phases 1-2; phases 3-4 are pure post-processing.
+
+#### Phase 1 — Recovery Point Scanning (per-vault, parallel)
+
+Discovers all RSV vaults via Azure Resource Graph, then scans each vault in parallel using `az backup item list` + `az backup recoverypoint list`:
+
+1. **Items**: fetches all backup items from the vault via backup management API.
+2. **Soft-delete filter**: items with `isScheduledForDeferredDelete=true` are captured in **report 15** and **skipped from RP enumeration** (optimization + semantics — these are already being destroyed by Azure). Note: the backup API (`az backup item list`) does **not** return items in `SoftDeleted` state at all — those are only visible via ARG and are handled in phase 2.
+3. **RP enumeration**: for each remaining item, enumerates recovery points via `az backup recoverypoint list`.
+4. **No-expiry detection**: RPs with null `expiryTime` (after `SKIP_RECENT_HOURS` filter) → **report 1**. For each, inferred expiry is calculated as `recoveryPointTime + policy retention days`. If the vault's policy can be resolved, uses actual retention (`RSV_Assigned_Policy`); otherwise falls back to `ASSUMED_MAX_RETENTION_DAYS` (`Assumed_Max_Retention`). Inferred-expiry RPs are split into **report 13** (already elapsed) and **report 14** (not yet elapsed). Items with `protectionState` in `INFERRED_EXCLUDE_STATES` (default `SoftDeleted`) are excluded from reports 13/14.
+5. **Old-RP detection**: RPs older than `RP_AGE_MONTHS` (regardless of expiry) → **report 4**.
+6. **Timeout handling**: vaults that exceed `VAULT_TIMEOUT` are killed → **report 7** (treated as dirty).
+
+**Produces**: reports 1, 4, 7, 13, 14, 15.
+
+#### Phase 2 — No-Policy Item Discovery (tenant-wide ARG)
+
+Queries Azure Resource Graph for backup items with no policy assigned (`policyId` and `policyName` both empty). The ARG query excludes:
+
+- `protectionState == 'SoftDeleted'` — items already in soft-delete lifecycle
+- `isScheduledForDeferredDelete == true` — items with active deferred-delete countdown
+
+Additionally queries ARG for all soft-deleted items (`protectionState == 'SoftDeleted'` or `isScheduledForDeferredDelete == true`) and writes them to **report 15** for audit visibility. This is the authoritative source for report 15 since the backup API does not return soft-deleted items.
+
+Remaining items (all `ProtectionStopped` in practice) → **report 2**, with state distribution → **report 11**.
+
+**Produces**: reports 2, 11, 15.
+
+#### Phase 3 — Cross-Reference (offline join)
+
+Joins report 1 (no-expiry RPs) with report 2 (no-policy items) by vault+item name. Items that appear in **both** — no policy AND no-expiry RPs — are the real immutability risk → **report 3**, with state distribution → **report 12**.
+
+**Produces**: reports 3, 12.
+
+#### Phase 4 — Vault Classification (offline)
+
+Classifies each vault as clean or dirty based on presence in reports 3, 4, and 7:
+
+| Dirty reason | Source | Meaning |
+|--------------|--------|---------|
+| `no-policy-no-expiry` | Report 3 | Item has no policy AND has no-expiry RPs |
+| `old-rps` | Report 4 | Has recovery points older than `RP_AGE_MONTHS` |
+| `timeout` | Report 7 | Vault scan timed out — forced to manual review |
+
+Vaults with **any** dirty reason → **report 6**. Vaults with **no** dirty reasons → **report 5**. Item-level detail for dirty vaults → **report 10**. Plain-text clean vault names → **clean-vaults-*.list**.
+
+If auto-retry is enabled and timeouts occurred, the full 4-phase cycle is re-run for timed-out vaults only. Final reconciliation merges results → **reports 8** (final clean) and **9** (final dirty).
+
+**Produces**: reports 5, 6, 8, 9, 10, clean-vaults list.
+
+#### Protection States
+
+The tool observes these backup item states (Azure naming varies between backup API and ARG):
+
+| Backup API state | ARG state | Meaning | Handling |
+|-----------------|-----------|---------|----------|
+| `Protected` | `ProtectionConfigured` | Active backup, policy attached | Normal — RPs enumerated, included in all reports |
+| `BackupsSuspended` | `BackupsSuspended` | Policy attached but execution paused | RPs enumerated, included in all reports |
+| `ProtectionStopped` | `ProtectionStopped` | "Stop backup with retain data" — policy detached | RPs enumerated. **Primary source of orphan RPs** |
+| *(not returned)* | `SoftDeleted` | "Delete backup data" executed, soft-delete countdown active | Excluded from reports 1-4, 13-14. Captured in report 15 via ARG |
+
+Items in `SoftDeleted` state are **not returned** by `az backup item list` — they only appear in Azure Resource Graph. The tool captures them in report 15 via a dedicated ARG query in phase 2 for audit purposes.
+
 ### Output Files (timestamped)
 
-All CSVs are written on-the-fly so partial data survives crashes. Reports 1-2 are the raw data collected in Phase 1 and 2, reports 3-9 are derived from them:
+All CSVs are written on-the-fly so partial data survives crashes:
 
-- `1-no-expiry-rps-*.csv` — Recovery points with null `expiryTime` (after `SKIP_RECENT_HOURS`)
-- `2-no-policy-items-*.csv` — Backup items with no policy assigned
-- `3-no-expiry-no-policy-*.csv` — Items in **both** lists (the real risk)
-- `4-old-rps-*.csv` — Recovery points whose `recoveryPointTime` is before the RP age cutoff (`RP_AGE_MONTHS`); includes **any** RP (expiry column shows null or date)
-- `5-clean-vaults-*.csv` — Vaults not appearing in reports 3, 4, or 7
-- `6-dirty-vaults-*.csv` — Vaults appearing in report 3, report 4, or timeout report (with reason)
-- `7-timed-out-vaults-*.csv` — Vault workers killed after `VAULT_TIMEOUT`; treated as `dirty` with reason `timeout`
-- `8-final-clean-vaults-*.csv` — Final authoritative clean list after timeout retry reconciliation
-- `9-final-dirty-vaults-*.csv` — Final authoritative dirty list after timeout retry reconciliation
-- `10-dirty-items-detail-*.csv` — Item-level detail for every dirty vault: offending items/RPs with reason, RP time, type, and expiry (for review)
-- `11-no-policy-protectionstate-distribution-*.csv` — `protectionState` distribution for all no-policy items
-- `12-overlap-protectionstate-distribution-*.csv` — `protectionState` distribution for overlap subset (no-policy + no-expiry)
-- `13-inferred-expiry-passed-*.csv` — Null-expiry RPs where inferred expiry is already elapsed (includes `protectionState`, `inferenceBase`, `retentionDays`)
-- `14-inferred-expiry-not-passed-*.csv` — Null-expiry RPs where inferred expiry has not elapsed yet (includes `protectionState`, `inferenceBase`, `retentionDays`)
-- `15-deferred-delete-items-*.csv` — Backup items scheduled for deferred delete / soft-delete lifecycle (excluded from RP enumeration and inferred-risk reports)
-- `clean-vaults-*.list` — Plain text list of clean vault names (one per line, no header) for use as input to bulk operations (e.g. immutability-management workflow whitelist)
+- `1-no-expiry-rps-*.csv` — Recovery points with null `expiryTime` (after `SKIP_RECENT_HOURS`) *(Phase 1)*
+- `2-no-policy-items-*.csv` — Backup items with no policy assigned *(Phase 2)*
+- `3-no-expiry-no-policy-*.csv` — Items in **both** lists (the real risk) *(Phase 3)*
+- `4-old-rps-*.csv` — Recovery points whose `recoveryPointTime` is before the RP age cutoff (`RP_AGE_MONTHS`); includes **any** RP (expiry column shows null or date) *(Phase 1)*
+- `5-clean-vaults-*.csv` — Vaults not appearing in reports 3, 4, or 7 *(Phase 4)*
+- `6-dirty-vaults-*.csv` — Vaults appearing in report 3, report 4, or timeout report (with reason) *(Phase 4)*
+- `7-timed-out-vaults-*.csv` — Vault workers killed after `VAULT_TIMEOUT`; treated as `dirty` with reason `timeout` *(Phase 1)*
+- `8-final-clean-vaults-*.csv` — Final authoritative clean list after timeout retry reconciliation *(Phase 4 + retry)*
+- `9-final-dirty-vaults-*.csv` — Final authoritative dirty list after timeout retry reconciliation *(Phase 4 + retry)*
+- `10-dirty-items-detail-*.csv` — Item-level detail for every dirty vault: offending items/RPs with reason, RP time, type, and expiry (for review) *(Phase 4)*
+- `11-no-policy-protectionstate-distribution-*.csv` — `protectionState` distribution for all no-policy items *(Phase 2)*
+- `12-overlap-protectionstate-distribution-*.csv` — `protectionState` distribution for overlap subset (no-policy + no-expiry) *(Phase 3)*
+- `13-inferred-expiry-passed-*.csv` — Null-expiry RPs where inferred expiry is already elapsed (includes `protectionState`, `inferenceBase`, `retentionDays`) *(Phase 1)*
+- `14-inferred-expiry-not-passed-*.csv` — Null-expiry RPs where inferred expiry has not elapsed yet (includes `protectionState`, `inferenceBase`, `retentionDays`) *(Phase 1)*
+- `15-soft-deleted-items-*.csv` — Backup items in soft-delete lifecycle (`SoftDeleted` / `isScheduledForDeferredDelete`), queried from ARG. These are excluded from RP enumeration and all risk reports — captured for audit only *(Phase 2)*
+- `clean-vaults-*.list` — Plain text list of clean vault names (one per line, no header) for use as input to bulk operations (e.g. immutability-management workflow whitelist) *(Phase 4)*
 
 ### Clean vs dirty vaults
 
-**Report 1** lists only recovery points **without** an expiry (`expiryTime` null), with default behavior skipping the last **48 hours** (`SKIP_RECENT_HOURS=48`). **Report 4** lists recovery points older than **13 months** by default (`RP_AGE_MONTHS=13`) using `recoveryPointTime`, **whether or not** they have retention expiry — this drives the “retention / hygiene” bucket for vault locking.
+The tool classifies every scanned vault as **clean** or **dirty** based on whether it poses a risk for immutability locking.
 
-**Dirty** — a vault in **`dirty-vaults-*.csv`** if **any**:
+#### Clean vault
 
-1. **Report 3** (`3-no-expiry-no-policy-*.csv`): at least one item **has no policy** and still has **no-expiry** RPs in report 1 (overlap).
-2. **Report 4** (`4-old-rps-*.csv`): at least one recovery point (any expiry) is **older than** the configured age threshold.
-3. **Report 7** (`7-timed-out-vaults-*.csv`): vault scan timed out and is forced to manual review (`timeout` reason).
+A vault is **clean** (`clean-vaults-*.csv`) when it has **zero** rows in reports 3, 4, and 7 — meaning:
 
-**Clean** — vault appears only in **`clean-vaults-*.csv`**: no rows from report 3, 4, or 7.
+- No orphaned items: every backup item either has a policy attached or has no null-expiry recovery points.
+- No stale RPs: no recovery point is older than the configured age threshold (`RP_AGE_MONTHS`, default 13 months).
+- Scan completed: the vault did not time out.
 
-The **`reason`** column on dirty vaults includes `no-policy-no-expiry`, `old-rps`, `timeout`, or combinations.
+**Clean vaults are safe to lock for immutability** provided you review report 1 for the vault — a clean vault can still have no-expiry RPs if those items have a policy attached (they pass report 3 but could be “Retain forever” items that become permanently undeletable after locking).
+
+Soft-deleted items (report 15) are excluded by design — they auto-purge after the retention countdown and are not a lock risk.
+
+#### Dirty vault
+
+A vault is **dirty** (`dirty-vaults-*.csv`) if **any** of:
+
+| Dirty reason | Source | Meaning | Ops action required |
+|--------------|--------|---------|---------------------|
+| `no-policy-no-expiry` | Report 3 | Item has no policy AND has null-expiry RPs | **Delete backup data** (`az backup item delete --delete-backup-data`) or re-attach a finite-retention policy. Most likely cause: “Stop backup with retain data” was used but nobody clicked “Delete data” — backups are orphaned. |
+| `old-rps` | Report 4 | RP older than `RP_AGE_MONTHS` threshold | Review old RPs. If policy has finite retention they should auto-expire; if “retain forever”, manually delete or change policy. |
+| `timeout` | Report 7 | Vault scan timed out | Re-run with longer `VAULT_TIMEOUT` or manually inspect. |
+
+The `reason` column on dirty vaults includes one or more of: `no-policy-no-expiry`, `old-rps`, `timeout`.
+
+Use **report 10** (`dirty-items-detail-*.csv`) to get per-item detail for handing to ops teams.
 
 When auto retry runs, the tool keeps first-pass and retry artifacts intact, then emits **final** clean/dirty CSVs where previously timed-out vaults are reclassified from retry outcomes.
 
@@ -126,13 +207,14 @@ AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 go run ./cmd
 - `ASSUMED_MAX_RETENTION_DAYS` (default `3650`) — Fallback retention used for inferred-expiry reports when assigned policy retention cannot be resolved (`3650` = 10 years, chosen as conservative upper-bound assumption)
 - `INFERRED_EXCLUDE_STATES` (default `SoftDeleted`) — Comma-separated backup item protection states to exclude from inferred-expiry reports (example: `SoftDeleted,BackupStopped`)
 
-### Deferred-delete optimization
+### Soft-delete handling
 
-Items with `isScheduledForDeferredDelete=true` are treated as soft-delete lifecycle artifacts:
+Backup items in the soft-delete lifecycle are handled at two levels:
 
-- skipped from phase 1 RP enumeration for speed,
-- excluded from inferred expiry reports (`13` / `14`),
-- captured in report `15-deferred-delete-items-*.csv` for manual verification/audit.
+1. **Phase 1 (backup API)**: Items with `isScheduledForDeferredDelete=true` are skipped from RP enumeration (belt-and-suspenders — in practice `az backup item list` does not return `SoftDeleted` items at all).
+2. **Phase 2 (ARG)**: A dedicated ARG query captures all items with `protectionState == 'SoftDeleted'` or `isScheduledForDeferredDelete == true` and writes them to report 15 for audit. The no-policy query separately excludes both states to keep them out of report 2.
+
+Items in `SoftDeleted` state are only visible in Azure Resource Graph, not in the backup management API. Once the soft-delete retention period expires, items disappear from both APIs entirely — there is no "completed soft delete" state.
 
 ### Prerequisites
 
