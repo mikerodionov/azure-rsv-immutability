@@ -56,11 +56,11 @@ Joins report 1 (no-expiry RPs) with report 2 (no-policy items) by vault+item nam
 
 Classifies each vault as clean or dirty based on presence in reports 3, 4, and 7:
 
-| Dirty reason | Source | Meaning |
-|--------------|--------|---------|
-| `no-policy-no-expiry` | Report 3 | Item has no policy AND has no-expiry RPs |
-| `old-rps` | Report 4 | Has recovery points older than `RP_AGE_MONTHS` |
-| `timeout` | Report 7 | Vault scan timed out — forced to manual review |
+| Dirty reason          | Source   | Meaning                                        |
+| --------------------- | -------- | ---------------------------------------------- |
+| `no-policy-no-expiry` | Report 3 | Item has no policy AND has no-expiry RPs       |
+| `old-rps`             | Report 4 | Has recovery points older than `RP_AGE_MONTHS` |
+| `timeout`             | Report 7 | Vault scan timed out — forced to manual review |
 
 Vaults with **any** dirty reason → **report 6**. Vaults with **no** dirty reasons → **report 5**. Item-level detail for dirty vaults → **report 10**. Plain-text clean vault names → **clean-vaults-*.list**.
 
@@ -72,12 +72,12 @@ If auto-retry is enabled and timeouts occurred, the full 4-phase cycle is re-run
 
 The tool observes these backup item states (Azure naming varies between backup API and ARG):
 
-| Backup API state | ARG state | Meaning | Handling |
-|-----------------|-----------|---------|----------|
-| `Protected` | `ProtectionConfigured` | Active backup, policy attached | Normal — RPs enumerated, included in all reports |
-| `BackupsSuspended` | `BackupsSuspended` | Policy attached but execution paused | RPs enumerated, included in all reports |
-| `ProtectionStopped` | `ProtectionStopped` | "Stop backup with retain data" — policy detached | RPs enumerated. **Primary source of orphan RPs** |
-| *(not returned)* | `SoftDeleted` | "Delete backup data" executed, soft-delete countdown active | Excluded from reports 1-4, 13-14. Captured in report 15 via ARG |
+| Backup API state    | ARG state              | Meaning                                                     | Handling                                                        |
+| ------------------- | ---------------------- | ----------------------------------------------------------- | --------------------------------------------------------------- |
+| `Protected`         | `ProtectionConfigured` | Active backup, policy attached                              | Normal — RPs enumerated, included in all reports                |
+| `BackupsSuspended`  | `BackupsSuspended`     | Policy attached but execution paused                        | RPs enumerated, included in all reports                         |
+| `ProtectionStopped` | `ProtectionStopped`    | "Stop backup with retain data" — policy detached            | RPs enumerated. **Primary source of orphan RPs**                |
+| *(not returned)*    | `SoftDeleted`          | "Delete backup data" executed, soft-delete countdown active | Excluded from reports 1-4, 13-14. Captured in report 15 via ARG |
 
 Items in `SoftDeleted` state are **not returned** by `az backup item list` — they only appear in Azure Resource Graph. The tool captures them in report 15 via a dedicated ARG query in phase 2 for audit purposes.
 
@@ -122,11 +122,11 @@ Soft-deleted items (report 15) are excluded by design — they auto-purge after 
 
 A vault is **dirty** (`dirty-vaults-*.csv`) if **any** of:
 
-| Dirty reason | Source | Meaning | Ops action required |
-|--------------|--------|---------|---------------------|
+| Dirty reason          | Source   | Meaning                                    | Ops action required                                                                                                                                                                                                               |
+| --------------------- | -------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `no-policy-no-expiry` | Report 3 | Item has no policy AND has null-expiry RPs | **Delete backup data** (`az backup item delete --delete-backup-data`) or re-attach a finite-retention policy. Most likely cause: “Stop backup with retain data” was used but nobody clicked “Delete data” — backups are orphaned. |
-| `old-rps` | Report 4 | RP older than `RP_AGE_MONTHS` threshold | Review old RPs. If policy has finite retention they should auto-expire; if “retain forever”, manually delete or change policy. |
-| `timeout` | Report 7 | Vault scan timed out | Re-run with longer `VAULT_TIMEOUT` or manually inspect. |
+| `old-rps`             | Report 4 | RP older than `RP_AGE_MONTHS` threshold    | Review old RPs. If policy has finite retention they should auto-expire; if “retain forever”, manually delete or change policy.                                                                                                    |
+| `timeout`             | Report 7 | Vault scan timed out                       | Re-run with longer `VAULT_TIMEOUT` or manually inspect.                                                                                                                                                                           |
 
 The `reason` column on dirty vaults includes one or more of: `no-policy-no-expiry`, `old-rps`, `timeout`.
 
