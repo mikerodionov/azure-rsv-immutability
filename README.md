@@ -216,6 +216,74 @@ Backup items in the soft-delete lifecycle are handled at two levels:
 
 Items in `SoftDeleted` state are only visible in Azure Resource Graph, not in the backup management API. Once the soft-delete retention period expires, items disappear from both APIs entirely — there is no "completed soft delete" state.
 
+### RSV Behavioral Assumptions
+
+This section documents observed Azure Recovery Services Vault behaviors that this tool relies on for its classification logic. These are based on testing, API observation, and available documentation. **None of these are guaranteed by Azure SLA** — validate against your own environment before making operational decisions.
+
+#### 1. Recovery points carry an internal expiry tag not exposed via API
+
+Every recovery point is tagged with an intended expiration date on the service side at creation time, derived from the backup policy retention settings. However, this internal tag is **not always surfaced** in the portal or `az backup recoverypoint list` API — the `expiryTime` property frequently returns `null`.
+
+Known cases where `expiryTime` is null:
+- **Recent RPs (< 24-48h old)**: The expiry metadata is stamped asynchronously by a background GC/hardening process. Until a superseding RP is created and hardened, the latest 1-2 RPs show null expiry. Documented: [Azure Backup FAQ — Why the expiry time for latest recovery points doesn't appear](https://learn.microsoft.com/en-us/azure/backup/backup-azure-vm-backup-faq#why-the-expiry-time-for-latest-recovery-points-doesn-t-appear-in-the-azure-portal-for-vms).
+- **LTR recovery points**: Weekly, monthly, and yearly retention RPs consistently show null `expiryTime`. Retention for these appears to be managed internally by policy-based count/time rules rather than an explicit per-RP expiry timestamp.
+
+**Tool implication**: `SKIP_RECENT_HOURS` (default 48) filters out the first case. The second case is why the tool infers expiry from policy retention settings (reports 13/14) rather than relying solely on the API-reported `expiryTime`.
+
+#### 2. "Retain forever" adds a GC-ignore flag, not infinite retention
+
+When "Stop protection → Retain backup data (forever)" is selected, the existing RPs keep their original policy-based internal expiry tags. The "retain forever" option adds a **garbage-collection ignore flag** that prevents automatic cleanup — but it does **not** remove or override the internal expiry.
+
+Consequence: after the internal expiry passes, **manual deletion still works** — even on a locked immutable vault. The operational challenge is knowing *when* the internal expiry passes, since it is not visible via API. It must be derived from the original policy's retention period at the time protection was stopped.
+
+**Tool implication**: This is why the tool computes inferred expiry (`recoveryPointTime + policy retention days`) and classifies items where this inferred expiry has already passed (report 13) separately from those where it hasn't (report 14).
+
+#### 3. Immutability blocks deletion of pre-existing stopped/retained RPs
+
+Enabling immutability on a vault **retroactively affects** all existing recovery points, including those from items where protection was already stopped with "retain data" before immutability was enabled. Deletion of these RPs is blocked until their internal expiry passes, same as for RPs created after immutability was enabled.
+
+This was confirmed through testing — it contradicts the intuition that pre-immutability items would be grandfathered in.
+
+Ref: [Immutable vault — restricted operations](https://learn.microsoft.com/en-us/azure/backup/backup-azure-immutable-vault-how-to-manage?tabs=recovery-services-vault#perform-restricted-operations).
+
+#### 4. "Retain as per policy" option only exists on immutable vaults
+
+The "Stop protection" dialog offers two retention sub-options **only when immutability is enabled** (locked or unlocked):
+- **Retain forever** — adds the GC-ignore flag (assumption 2)
+- **Retain as per policy** — retains RPs according to the attached policy's retention schedule
+
+On non-immutable vaults, "Stop with retain data" implicitly means "retain forever" — there is no sub-option.
+
+**Governance gap**: Even on immutable vaults, there is no way to block the "Retain forever" option via Azure Policy or RBAC. Operators can still select it, creating no-expiry RPs that must be tracked manually. Consider enforcing this via organizational policy/training.
+
+#### 5. The last recovery point is never automatically deleted
+
+For any backup item, Azure never automatically removes the last remaining recovery point — regardless of policy retention settings or expiry. It must be manually deleted via `az backup protection disable --delete-backup-data`.
+
+This means that even after all policy-driven RPs expire naturally (e.g., post-VM decommission), one RP will always remain and must be cleaned up as an operational step.
+
+**Tool implication**: Items in `ProtectionStopped` state with a single remaining RP are expected and common — they appear in report 10 as actionable cleanup candidates.
+
+#### 6. "Oldest restore point" is a portal-only property
+
+The "Oldest restore point" date shown in the Azure portal for backup items is a GUI-only computation. There is no REST API or CLI command to retrieve this value directly — it is derived from existing queries internally by the portal.
+
+**Tool implication**: The tool enumerates all RPs via `az backup recoverypoint list` and derives age metrics directly, which is the only reliable method available via automation.
+
+#### 7. Soft-deleted items are invisible to the backup management API
+
+Items in `SoftDeleted` state (after "Delete backup data" is executed, during the soft-delete retention countdown) are **not returned** by `az backup item list`. They are only visible via Azure Resource Graph queries on `recoveryservicesresources`.
+
+Once the soft-delete retention period expires, the item disappears from both APIs entirely — there is no "completed soft delete" state.
+
+**Tool implication**: Report 15 uses a dedicated ARG query to capture soft-deleted items. They are excluded from risk reports (1-4, 13-14) since they are already in a destruction lifecycle.
+
+#### 8. No per-recovery-point delete API exists
+
+Azure does not expose an API to delete individual recovery points from a backup item. The only deletion path is `az backup protection disable --delete-backup-data`, which removes **all** recovery points for the item. For actively `Protected` items, this destroys current backups — making it unsuitable for cleaning up individual old RPs on production workloads.
+
+**Tool implication**: Report 10 separates `ProtectionStopped`/`BackupsSuspended` items (cleanable via `--delete-backup-data` without risk) from `Protected` items (blocked — would destroy active backups). The 147-item "blocked" category in a typical scan requires a different remediation path (e.g., wait for natural expiry, or open a support case).
+
 ### Prerequisites
 
 - Go 1.22+ (for local run/build)
