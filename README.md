@@ -163,10 +163,20 @@ go run ./cmd/rsv-immutability-readiness --scan
 
 Report mode cache behavior:
 
-- Cached clean-vault summary is accepted only when both final files exist for the same timestamp:
+- Cached clean-vault summary is accepted only when all artifacts exist for the same timestamp:
   - `8-final-clean-vaults-<timestamp>.csv`
   - `9-final-dirty-vaults-<timestamp>.csv`
-- If final files are missing, mismatched, or have invalid CSV headers, report mode treats this as no cache and prints: run with `--scan`.
+  - `clean-vaults-<timestamp>.list`
+- Validation rules for cached summary:
+  - both final CSV headers must match expected schema
+  - final clean CSV must contain at least one vault row
+  - clean list must be non-empty
+  - clean list row count must match final clean CSV row count (header-like first line in list is tolerated)
+- If any check fails, report mode treats this as no cache and prints: run with `--scan`.
+
+Scan mode empty-environment behavior:
+
+- If phase 1 discovers zero Recovery Services Vaults, scan mode stops early, prints an explicit message, and removes generated artifacts for that run timestamp.
 
 Examples:
 

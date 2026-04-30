@@ -120,6 +120,15 @@ func runScanMode() error {
 	if err := runPhase(ctx, "Phase 1/4", phase1RecoveryPoints, runCtx); err != nil {
 		return err
 	}
+	if runCtx.Stats.VaultCount == 0 {
+		log.Printf("[*] no Recovery Services Vaults discovered; stopping scan early")
+		if err := cleanupRunArtifacts(runCtx.CSV); err != nil {
+			log.Printf("[!] failed to clean generated artifacts for empty run: %v", err)
+		}
+		fmt.Println()
+		fmt.Println("No Recovery Services Vaults found. Scan stopped early and generated report files were removed.")
+		return nil
+	}
 	if err := runPhase(ctx, "Phase 2/4", phase2NoPolicy, runCtx); err != nil {
 		return err
 	}
@@ -775,6 +784,18 @@ func ensureWritableDir(dir string) error {
 	return nil
 }
 
+func cleanupRunArtifacts(csvPaths map[string]string) error {
+	var firstErr error
+	for _, path := range csvPaths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
 type ImmutabilityStats struct {
 	TotalVaults     int
 	Subscriptions   int
@@ -900,6 +921,7 @@ func findLatestValidPair(reportDir string, cfg cachedPairConfig) (*cachedCleanRu
 	}
 	cleanByTS := map[string]string{}
 	dirtyByTS := map[string]string{}
+	listByTS := map[string]string{}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -911,27 +933,47 @@ func findLatestValidPair(reportDir string, cfg cachedPairConfig) (*cachedCleanRu
 		}
 		if ts, ok := parseTimestampFromReportName(name, cfg.DirtyPrefix); ok {
 			dirtyByTS[ts] = filepath.Join(reportDir, name)
+			continue
+		}
+		if ts, ok := parseTimestampFromListName(name, "clean-vaults-"); ok {
+			listByTS[ts] = filepath.Join(reportDir, name)
 		}
 	}
-	if len(cleanByTS) == 0 || len(dirtyByTS) == 0 {
+	if len(cleanByTS) == 0 || len(dirtyByTS) == 0 || len(listByTS) == 0 {
 		return nil, nil
 	}
 	timestamps := make([]string, 0)
 	for ts := range cleanByTS {
 		if _, ok := dirtyByTS[ts]; ok {
-			timestamps = append(timestamps, ts)
+			if _, hasList := listByTS[ts]; hasList {
+				timestamps = append(timestamps, ts)
+			}
 		}
+	}
+	if len(timestamps) == 0 {
+		return nil, nil
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(timestamps)))
 	for _, ts := range timestamps {
 		cleanPath := cleanByTS[ts]
 		dirtyPath := dirtyByTS[ts]
+		listPath := listByTS[ts]
 		cleanCount, err := validateCSVAndCountRows(cleanPath, cfg.CleanHeader)
 		if err != nil {
 			continue
 		}
+		if cleanCount == 0 {
+			continue
+		}
 		dirtyCount, err := validateCSVAndCountRows(dirtyPath, cfg.DirtyHeader)
 		if err != nil {
+			continue
+		}
+		listCount, err := validateCleanListAndCountRows(listPath)
+		if err != nil {
+			continue
+		}
+		if listCount != cleanCount {
 			continue
 		}
 		return &cachedCleanRun{
@@ -941,6 +983,48 @@ func findLatestValidPair(reportDir string, cfg cachedPairConfig) (*cachedCleanRu
 		}, nil
 	}
 	return nil, nil
+}
+
+func parseTimestampFromListName(name, prefix string) (string, bool) {
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".list") {
+		return "", false
+	}
+	ts := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".list")
+	if len(ts) != len("20060102-150405") {
+		return "", false
+	}
+	if _, err := time.Parse("20060102-150405", ts); err != nil {
+		return "", false
+	}
+	return ts, true
+}
+
+func validateCleanListAndCountRows(path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	lines := strings.Split(string(raw), "\n")
+	names := make([]string, 0, len(lines))
+	for _, line := range lines {
+		v := strings.TrimSpace(line)
+		if v == "" {
+			continue
+		}
+		names = append(names, v)
+	}
+	if len(names) == 0 {
+		return 0, fmt.Errorf("clean list is empty: %s", path)
+	}
+	// Backward compatibility with optional header-like first line.
+	first := strings.ToLower(strings.TrimSpace(names[0]))
+	if first == "vaultname" || first == "vault" || first == "name" {
+		names = names[1:]
+	}
+	if len(names) == 0 {
+		return 0, fmt.Errorf("clean list has header only: %s", path)
+	}
+	return len(names), nil
 }
 
 func parseTimestampFromReportName(name, prefix string) (string, bool) {
