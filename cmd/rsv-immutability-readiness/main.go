@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -69,6 +70,17 @@ type RunContext struct {
 	Stats     FullStats
 }
 
+type Mode string
+
+const (
+	modeReport Mode = "report"
+	modeScan   Mode = "scan"
+)
+
+type AppArgs struct {
+	Mode Mode
+}
+
 // Entrypoint and high-level orchestration.
 func main() {
 	if err := runFull(); err != nil {
@@ -77,6 +89,17 @@ func main() {
 }
 
 func runFull() error {
+	args, err := parseArgs(os.Args[1:])
+	if err != nil {
+		return err
+	}
+	if args.Mode == modeReport {
+		return runReportMode()
+	}
+	return runScanMode()
+}
+
+func runScanMode() error {
 	start := time.Now()
 	cfg, err := loadConfig()
 	if err != nil {
@@ -151,6 +174,44 @@ func runFull() error {
 	}
 	printSummary(runCtx, time.Since(start))
 	return nil
+}
+
+func runReportMode() error {
+	printBanner()
+	if err := ensureAzureReady(); err != nil {
+		return err
+	}
+	stats, err := collectImmutabilityStats()
+	if err != nil {
+		return err
+	}
+	printImmutabilitySummary(stats)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("config error: %w", err)
+	}
+	if err := printCachedCleanSummary(cfg.ReportDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseArgs(args []string) (AppArgs, error) {
+	fs := flag.NewFlagSet("rsv-immutability-readiness", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	report := fs.Bool("report", false, "run fast summary report mode")
+	scan := fs.Bool("scan", false, "run full multi-phase scan")
+	if err := fs.Parse(args); err != nil {
+		return AppArgs{}, fmt.Errorf("failed to parse args: %w", err)
+	}
+	if *report && *scan {
+		return AppArgs{}, fmt.Errorf("use either --report or --scan, not both")
+	}
+	if *scan {
+		return AppArgs{Mode: modeScan}, nil
+	}
+	return AppArgs{Mode: modeReport}, nil
 }
 
 func runPhase(ctx context.Context, title string, fn func(context.Context, *RunContext) error, runCtx *RunContext) error {
@@ -712,6 +773,216 @@ func ensureWritableDir(dir string) error {
 	_ = testFile.Close()
 	_ = os.Remove(testFile.Name())
 	return nil
+}
+
+type ImmutabilityStats struct {
+	TotalVaults     int
+	Subscriptions   int
+	DisabledCount   int
+	UnlockedCount   int
+	LockedCount     int
+	NotConfigured   int
+	UnknownStateCnt int
+}
+
+func collectImmutabilityStats() (ImmutabilityStats, error) {
+	query := `Resources
+| where type =~ 'microsoft.recoveryservices/vaults'
+| extend immutabilityState = tostring(properties.securitySettings.immutabilitySettings.state)
+| extend normalizedState = case(
+    isempty(immutabilityState), 'Not configured',
+    tolower(immutabilityState) == 'notconfigured', 'Not configured',
+    tolower(immutabilityState) == 'disabled', 'Disabled',
+    tolower(immutabilityState) == 'unlocked', 'Unlocked',
+    tolower(immutabilityState) == 'locked', 'Locked',
+    'Unknown')
+| summarize totalVaults=count(),
+            subscriptions=dcount(subscriptionId),
+            disabled=countif(normalizedState == 'Disabled'),
+            unlocked=countif(normalizedState == 'Unlocked'),
+            locked=countif(normalizedState == 'Locked'),
+            notConfigured=countif(normalizedState == 'Not configured'),
+            unknown=countif(normalizedState == 'Unknown')`
+	body, err := runAzJSON("graph", "query", "-q", query, "--first", "1")
+	if err != nil {
+		return ImmutabilityStats{}, err
+	}
+	rows, err := extractData(body)
+	if err != nil {
+		return ImmutabilityStats{}, err
+	}
+	if len(rows) == 0 {
+		return ImmutabilityStats{}, nil
+	}
+	row := rows[0]
+	return ImmutabilityStats{
+		TotalVaults:     getInt(row, "totalVaults", "totalvaults"),
+		Subscriptions:   getInt(row, "subscriptions"),
+		DisabledCount:   getInt(row, "disabled") + getInt(row, "notConfigured", "notconfigured"),
+		UnlockedCount:   getInt(row, "unlocked"),
+		LockedCount:     getInt(row, "locked"),
+		NotConfigured:   getInt(row, "notConfigured", "notconfigured"),
+		UnknownStateCnt: getInt(row, "unknown"),
+	}, nil
+}
+
+func printImmutabilitySummary(stats ImmutabilityStats) {
+	fmt.Println()
+	fmt.Println("=============================================")
+	fmt.Println(" SUMMARY — RSV Immutability State")
+	fmt.Println("=============================================")
+	fmt.Printf("  %-40s %d\n", "Total vaults in subscriptions:", stats.TotalVaults)
+	fmt.Printf("  %-40s %d\n", "Subscriptions with vaults:", stats.Subscriptions)
+	fmt.Printf("  %-40s %d\n", "Immutability Disabled:", stats.DisabledCount)
+	fmt.Printf("  %-40s %d\n", "Immutability Enabled (Unlocked):", stats.UnlockedCount)
+	fmt.Printf("  %-40s %d\n", "Immutability Enabled (Locked):", stats.LockedCount)
+	if stats.NotConfigured > 0 {
+		fmt.Printf("  %-40s %d\n", "  └ Not configured (included in disabled):", stats.NotConfigured)
+	}
+	if stats.UnknownStateCnt > 0 {
+		fmt.Printf("  %-40s %d\n", "  └ Unknown state:", stats.UnknownStateCnt)
+	}
+	fmt.Println("=============================================")
+}
+
+func printCachedCleanSummary(reportDir string) error {
+	run, err := findLatestValidCleanRun(reportDir)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("=============================================")
+	fmt.Println(" CACHED CLEAN VAULT SUMMARY")
+	fmt.Println("=============================================")
+	if run == nil {
+		fmt.Println("  No cached results for clean vaults.")
+		fmt.Println("  Please run with --scan flag.")
+		fmt.Println("=============================================")
+		return nil
+	}
+	fmt.Printf("  %-40s %s\n", "Source run timestamp:", run.Timestamp)
+	fmt.Printf("  %-40s %d\n", "Clean vaults (cached):", run.CleanCount)
+	fmt.Printf("  %-40s %d\n", "Dirty vaults (cached):", run.DirtyCount)
+	fmt.Printf("  %-40s %d\n", "Total vaults (cached):", run.CleanCount+run.DirtyCount)
+	fmt.Println("=============================================")
+	return nil
+}
+
+type cachedCleanRun struct {
+	Timestamp  string
+	CleanCount int
+	DirtyCount int
+}
+
+type cachedPairConfig struct {
+	CleanPrefix string
+	DirtyPrefix string
+	CleanHeader string
+	DirtyHeader string
+}
+
+func findLatestValidCleanRun(reportDir string) (*cachedCleanRun, error) {
+	return findLatestValidPair(reportDir, cachedPairConfig{
+		CleanPrefix: "8-final-clean-vaults-",
+		DirtyPrefix: "9-final-dirty-vaults-",
+		CleanHeader: "subscription,resourceGroup,vaultName",
+		DirtyHeader: "subscription,resourceGroup,vaultName,reason",
+	})
+}
+
+func findLatestValidPair(reportDir string, cfg cachedPairConfig) (*cachedCleanRun, error) {
+	entries, err := os.ReadDir(reportDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	cleanByTS := map[string]string{}
+	dirtyByTS := map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if ts, ok := parseTimestampFromReportName(name, cfg.CleanPrefix); ok {
+			cleanByTS[ts] = filepath.Join(reportDir, name)
+			continue
+		}
+		if ts, ok := parseTimestampFromReportName(name, cfg.DirtyPrefix); ok {
+			dirtyByTS[ts] = filepath.Join(reportDir, name)
+		}
+	}
+	if len(cleanByTS) == 0 || len(dirtyByTS) == 0 {
+		return nil, nil
+	}
+	timestamps := make([]string, 0)
+	for ts := range cleanByTS {
+		if _, ok := dirtyByTS[ts]; ok {
+			timestamps = append(timestamps, ts)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(timestamps)))
+	for _, ts := range timestamps {
+		cleanPath := cleanByTS[ts]
+		dirtyPath := dirtyByTS[ts]
+		cleanCount, err := validateCSVAndCountRows(cleanPath, cfg.CleanHeader)
+		if err != nil {
+			continue
+		}
+		dirtyCount, err := validateCSVAndCountRows(dirtyPath, cfg.DirtyHeader)
+		if err != nil {
+			continue
+		}
+		return &cachedCleanRun{
+			Timestamp:  ts,
+			CleanCount: cleanCount,
+			DirtyCount: dirtyCount,
+		}, nil
+	}
+	return nil, nil
+}
+
+func parseTimestampFromReportName(name, prefix string) (string, bool) {
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".csv") {
+		return "", false
+	}
+	ts := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".csv")
+	if len(ts) != len("20060102-150405") {
+		return "", false
+	}
+	if _, err := time.Parse("20060102-150405", ts); err != nil {
+		return "", false
+	}
+	return ts, true
+}
+
+func validateCSVAndCountRows(path, expectedHeader string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r := csv.NewReader(f)
+	header, err := r.Read()
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(strings.Join(header, ",")) != expectedHeader {
+		return 0, fmt.Errorf("invalid CSV header in %s", path)
+	}
+	count := 0
+	for {
+		_, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+	return count, nil
 }
 
 // External command helpers.
@@ -1619,7 +1890,7 @@ func sortVaults(vaults []VaultInfo) {
 // Output rendering helpers.
 func printBanner() {
 	fmt.Println("=============================================")
-	fmt.Println(" RSV Immutability Readiness Check (Go)")
+	fmt.Println(" RSV Immutability Readiness Check")
 	fmt.Printf(" %s\n", time.Now().UTC().Format(time.RFC3339))
 	fmt.Println("=============================================")
 }
@@ -1640,7 +1911,7 @@ func printConfig(cfg Config) {
 func printSummary(runCtx *RunContext, elapsed time.Duration) {
 	fmt.Println()
 	fmt.Println("=============================================")
-	fmt.Println(" SUMMARY — RSV Immutability Readiness (Go)")
+	fmt.Println(" SUMMARY — RSV Immutability Readiness")
 	fmt.Println("=============================================")
 	fmt.Printf("  %-40s %d\n", "Total vaults scanned:", runCtx.Stats.VaultCount)
 	fmt.Printf("  %-40s %d\n", "No-expiry RPs:", runCtx.Stats.NoExpiryCount)
