@@ -151,41 +151,55 @@ Current status:
 Run it:
 
 ```bash
+# default mode (fast): immutability state summary + cached clean-vault summary
 go run ./cmd/rsv-immutability-readiness
+
+# same as default
+go run ./cmd/rsv-immutability-readiness --report
+
+# full long-running 4-phase scan (generates fresh CSVs)
+go run ./cmd/rsv-immutability-readiness --scan
 ```
+
+Report mode cache behavior:
+
+- Cached clean-vault summary is accepted only when both final files exist for the same timestamp:
+  - `8-final-clean-vaults-<timestamp>.csv`
+  - `9-final-dirty-vaults-<timestamp>.csv`
+- If final files are missing, mismatched, or have invalid CSV headers, report mode treats this as no cache and prints: run with `--scan`.
 
 Examples:
 
 ```bash
-# include all RPs regardless of age
-SKIP_RECENT_HOURS=0 go run ./cmd/rsv-immutability-readiness
+# include all RPs regardless of age (scan mode)
+SKIP_RECENT_HOURS=0 go run ./cmd/rsv-immutability-readiness --scan
 
-# 5 parallel vault workers
-PARALLEL=5 go run ./cmd/rsv-immutability-readiness
+# 5 parallel vault workers (scan mode)
+PARALLEL=5 go run ./cmd/rsv-immutability-readiness --scan
 
-# debug mode — 3 vaults max, verbose logging
-DEBUG=1 go run ./cmd/rsv-immutability-readiness
+# debug mode — 3 vaults max, verbose logging (scan mode)
+DEBUG=1 go run ./cmd/rsv-immutability-readiness --scan
 
 # debug 1 vault only
-DEBUG=1 DEBUG_MAX=1 go run ./cmd/rsv-immutability-readiness
+DEBUG=1 DEBUG_MAX=1 go run ./cmd/rsv-immutability-readiness --scan
 
 # set old RP threshold to 6 months instead of default 13
-RP_AGE_MONTHS=6 go run ./cmd/rsv-immutability-readiness
+RP_AGE_MONTHS=6 go run ./cmd/rsv-immutability-readiness --scan
 
 # summary only, no CSV files
-CSV_OUTPUT=0 go run ./cmd/rsv-immutability-readiness
+CSV_OUTPUT=0 go run ./cmd/rsv-immutability-readiness --scan
 
 # 15 minute timeout per vault (default 10 min)
-VAULT_TIMEOUT=900 go run ./cmd/rsv-immutability-readiness
+VAULT_TIMEOUT=900 go run ./cmd/rsv-immutability-readiness --scan
 
 # retry only previously timed-out vaults (recommended second pass)
-RETRY_VAULTS_CSV=../rsv-reports/7-timed-out-vaults-YYYYMMDD-HHMMSS.csv PARALLEL=5 VAULT_TIMEOUT=1200 go run ./cmd/rsv-immutability-readiness
+RETRY_VAULTS_CSV=../rsv-reports/7-timed-out-vaults-YYYYMMDD-HHMMSS.csv PARALLEL=5 VAULT_TIMEOUT=1200 go run ./cmd/rsv-immutability-readiness --scan
 
 # default behavior: auto-runs one retry pass when timeouts are detected
-AUTO_RETRY_TIMEOUTS=1 go run ./cmd/rsv-immutability-readiness
+AUTO_RETRY_TIMEOUTS=1 go run ./cmd/rsv-immutability-readiness --scan
 
 # tune automatic retry settings
-AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 go run ./cmd/rsv-immutability-readiness
+AUTO_RETRY_TIMEOUTS=1 AUTO_RETRY_PARALLEL=4 AUTO_RETRY_TIMEOUT=1800 go run ./cmd/rsv-immutability-readiness --scan
 ```
 
 ### Environment Variables
